@@ -6,7 +6,7 @@ Agente de seguridad universal para Claude Code. Audita cualquier proyecto — Ne
 
 ```bash
 # Clonar en tu directorio de skills de Claude Code
-git clone https://github.com/luisrecalde/auditron ~/.claude/skills/auditron
+git clone https://github.com/luis-recalde/auditron ~/.claude/skills/auditron
 
 # O copiar SKILL.md directamente al proyecto
 cp ~/.claude/skills/auditron/SKILL.md .claude/SKILL.md
@@ -15,8 +15,6 @@ cp ~/.claude/skills/auditron/SKILL.md .claude/SKILL.md
 ## Uso
 
 ```
-/cyber
-/security-audit
 /auditron
 ```
 
@@ -142,22 +140,22 @@ PRE-DEPLOY CHECKLIST — Next.js
 [ ] Dependencias actualizadas (90 días max de lag)
 ```
 
-## Comparativa
+## Por qué Auditron
 
-| Característica | cyber-neo | auditron |
-|---|---|---|
-| Patrones de secrets | ~40 | **70+** |
-| Variables en español | No | **Sí** |
-| Checks LATAM (MP, CUIT) | Parcial | **Completo** |
-| Stacks soportados | 4 | **7+** |
-| Código de fix incluido | No | **Sí** |
-| Checklist pre-deploy | No | **Sí** |
-| Scoring 0-100 | Sí | **Sí (mejorado)** |
-| CWE Top 25 | Parcial | **Completo** |
-| Auditoría deps (3 pkg managers) | No | **Sí** |
+**70+ patrones de secrets** — la cobertura más amplia disponible: AWS, GCP, Azure, Stripe, MercadoPago, Supabase, Firebase, GitHub, OpenAI, Anthropic y 60+ más. Ningún token se escapa.
+
+**LATAM-ready** — primer agente de seguridad con soporte nativo para MercadoPago (webhooks, IPN, tokens), validación de CUIT/CUIL/CBU, facturación electrónica AFIP/SAT/SII y checks específicos para el ecosistema latinoamericano.
+
+**Variables en español** — detecta `CLAVE_`, `SECRETO_`, `CONTRASENA_`, `TOKEN_MP_`, `USUARIO_DB_` y docenas de variantes en castellano que los scanners anglosajones pasan por alto.
+
+**7 stacks soportados** — Next.js, React, Node.js/Express, Python/FastAPI, WordPress, PHP genérico y sitios estáticos. La auditoría se adapta automáticamente al proyecto, sin configuración.
+
+**Fix code incluido** — cada hallazgo crítico y alto incluye el fragmento de código corregido listo para aplicar. No solo se reporta el problema: se entrega la solución.
+
+**Checklist pre-deploy** — al final de cada auditoría se genera una checklist específica para el stack detectado. Saber qué revisar antes de ir a producción, sin depender de la memoria.
 
 ## Autor
 
-**Luis Recalde** — [ancoratechus@gmail.com](mailto:ancoratechus@gmail.com)
+**Luis Recalde** — [info@luisrecalde.com](mailto:info@luisrecalde.com)
 
 Licencia MIT — 2026

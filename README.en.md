@@ -6,7 +6,7 @@ Universal security audit agent for Claude Code. Audits any project — Next.js, 
 
 ```bash
 # Clone into your Claude Code skills directory
-git clone https://github.com/luisrecalde/auditron ~/.claude/skills/auditron
+git clone https://github.com/luis-recalde/auditron ~/.claude/skills/auditron
 
 # Or copy SKILL.md directly into your project
 cp ~/.claude/skills/auditron/SKILL.md .claude/SKILL.md
@@ -15,8 +15,6 @@ cp ~/.claude/skills/auditron/SKILL.md .claude/SKILL.md
 ## Usage
 
 ```
-/cyber
-/security-audit
 /auditron
 ```
 
@@ -142,22 +140,22 @@ PRE-DEPLOY CHECKLIST — Next.js
 [ ] Dependencies up to date (90-day max lag)
 ```
 
-## Comparison
+## Why Auditron
 
-| Feature | cyber-neo | auditron |
-|---|---|---|
-| Secret patterns | ~40 | **70+** |
-| Spanish-language variables | No | **Yes** |
-| LATAM checks (MP, CUIT) | Partial | **Full** |
-| Supported stacks | 4 | **7+** |
-| Fix code included | No | **Yes** |
-| Pre-deploy checklist | No | **Yes** |
-| 0-100 scoring | Yes | **Yes (improved)** |
-| CWE Top 25 | Partial | **Full** |
-| Dep audit (3 pkg managers) | No | **Yes** |
+**70+ secret patterns** — the broadest coverage available: AWS, GCP, Azure, Stripe, MercadoPago, Supabase, Firebase, GitHub, OpenAI, Anthropic, and 60+ more. No token goes undetected.
+
+**LATAM-ready** — the first security agent with native support for MercadoPago (webhooks, IPN, tokens), CUIT/CUIL/CBU validation, electronic invoicing for AFIP/SAT/SII, and checks specific to the Latin American ecosystem.
+
+**Spanish-language variables** — detects `CLAVE_`, `SECRETO_`, `CONTRASENA_`, `TOKEN_MP_`, `USUARIO_DB_`, and dozens of Spanish variants that English-first scanners routinely miss.
+
+**7 supported stacks** — Next.js, React, Node.js/Express, Python/FastAPI, WordPress, generic PHP, and static sites. The audit adapts automatically to the project with zero configuration.
+
+**Fix code included** — every critical and high finding ships with a ready-to-apply corrected code snippet. Not just the problem — the solution.
+
+**Pre-deploy checklist** — every audit ends with a stack-specific checklist. Know exactly what to verify before going to production, without relying on memory.
 
 ## Author
 
-**Luis Recalde** — [ancoratechus@gmail.com](mailto:ancoratechus@gmail.com)
+**Luis Recalde** — [info@luisrecalde.com](mailto:info@luisrecalde.com)
 
 MIT License — 2026
