@@ -1,5 +1,9 @@
 # auditron
 
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Stars](https://img.shields.io/github/stars/luis-recalde/auditron?style=social)
+![Forks](https://img.shields.io/github/forks/luis-recalde/auditron?style=social)
+
 Universal security audit skill for Claude Code. Audits any project — Next.js, React, Python, Node.js, FastAPI, WordPress, static sites — and generates a professional report with a 0-100 score, prioritized findings, and ready-to-apply remediation code.
 
 ## Installation

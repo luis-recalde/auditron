@@ -1,5 +1,9 @@
 # auditron
 
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Stars](https://img.shields.io/github/stars/luis-recalde/auditron?style=social)
+![Forks](https://img.shields.io/github/forks/luis-recalde/auditron?style=social)
+
 Skill de seguridad universal para Claude Code. Audita cualquier proyecto — Next.js, React, Python, Node.js, FastAPI, WordPress, sitios estáticos — y genera un reporte profesional con puntuación 0-100, hallazgos priorizados y código de remediación incluido.
 
 ## Instalación
