@@ -1,6 +1,6 @@
 # auditron
 
-Universal security audit agent for Claude Code. Audits any project — Next.js, React, Python, Node.js, FastAPI, WordPress, static sites — and generates a professional report with a 0-100 score, prioritized findings, and ready-to-apply remediation code.
+Universal security audit skill for Claude Code. Audits any project — Next.js, React, Python, Node.js, FastAPI, WordPress, static sites — and generates a professional report with a 0-100 score, prioritized findings, and ready-to-apply remediation code.
 
 ## Installation
 
@@ -23,7 +23,7 @@ Or just tell Claude: *"audit this project"*, *"check security"*, *"find vulnerab
 ## What it analyzes
 
 ### Automatic stack detection
-The agent detects the project type and adapts the audit accordingly:
+Auditron detects the project type and adapts the audit accordingly:
 
 | Stack | Detection | Tools |
 |---|---|---|
@@ -142,17 +142,17 @@ PRE-DEPLOY CHECKLIST — Next.js
 
 ## Why Auditron
 
-**70+ secret patterns** — the broadest coverage available: AWS, GCP, Azure, Stripe, MercadoPago, Supabase, Firebase, GitHub, OpenAI, Anthropic, and 60+ more. No token goes undetected.
+Your website or app handles customer data, processes payments, and keeps your business running. A security breach can mean data loss, regulatory fines, and reputation damage — all at once.
 
-**LATAM-ready** — the first security agent with native support for MercadoPago (webhooks, IPN, tokens), CUIT/CUIL/CBU validation, electronic invoicing for AFIP/SAT/SII, and checks specific to the Latin American ecosystem.
+Auditron runs a full security review before that happens:
 
-**Spanish-language variables** — detects `CLAVE_`, `SECRETO_`, `CONTRASENA_`, `TOKEN_MP_`, `USUARIO_DB_`, and dozens of Spanish variants that English-first scanners routinely miss.
+**Finds what you can't see** — hardcoded passwords and API keys in your code, insecure settings, libraries with known vulnerabilities. These are the most common mistakes and the most expensive ones when attackers exploit them.
 
-**7 supported stacks** — Next.js, React, Node.js/Express, Python/FastAPI, WordPress, generic PHP, and static sites. The audit adapts automatically to the project with zero configuration.
+**Built for the region** — understands MercadoPago payments, AFIP/SAT/SII electronic invoicing, and sensitive data like CUIT or DNI. Not a generic English-first scanner: built for the Latin American ecosystem.
 
-**Fix code included** — every critical and high finding ships with a ready-to-apply corrected code snippet. Not just the problem — the solution.
+**No security expertise needed** — a single command audits the entire project. The report explains every issue in plain language with a ready-to-apply fix.
 
-**Pre-deploy checklist** — every audit ends with a stack-specific checklist. Know exactly what to verify before going to production, without relying on memory.
+**Professional-grade coverage** — follows the OWASP and CWE international standards used by enterprise security teams. The same rigor, available to any team.
 
 ## Author
 

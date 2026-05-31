@@ -1,6 +1,6 @@
 # auditron
 
-Agente de seguridad universal para Claude Code. Audita cualquier proyecto — Next.js, React, Python, Node.js, FastAPI, WordPress, sitios estáticos — y genera un reporte profesional con puntuación 0-100, hallazgos priorizados y código de remediación incluido.
+Skill de seguridad universal para Claude Code. Audita cualquier proyecto — Next.js, React, Python, Node.js, FastAPI, WordPress, sitios estáticos — y genera un reporte profesional con puntuación 0-100, hallazgos priorizados y código de remediación incluido.
 
 ## Instalación
 
@@ -23,7 +23,7 @@ O simplemente decirle a Claude: *"auditá este proyecto"*, *"revisá la segurida
 ## Qué analiza
 
 ### Detección automática de stack
-El agente detecta el tipo de proyecto y adapta la auditoría:
+Auditron detecta el tipo de proyecto y adapta la auditoría:
 
 | Stack | Detección | Herramientas |
 |---|---|---|
@@ -142,17 +142,17 @@ PRE-DEPLOY CHECKLIST — Next.js
 
 ## Por qué Auditron
 
-**70+ patrones de secrets** — la cobertura más amplia disponible: AWS, GCP, Azure, Stripe, MercadoPago, Supabase, Firebase, GitHub, OpenAI, Anthropic y 60+ más. Ningún token se escapa.
+Tu sitio web o aplicación maneja datos de clientes, procesa pagos y sostiene tu negocio. Una brecha de seguridad puede significar pérdida de datos, multas regulatorias y daño a tu reputación — todo a la vez.
 
-**LATAM-ready** — primer agente de seguridad con soporte nativo para MercadoPago (webhooks, IPN, tokens), validación de CUIT/CUIL/CBU, facturación electrónica AFIP/SAT/SII y checks específicos para el ecosistema latinoamericano.
+Auditron hace una revisión completa antes de que eso pase:
 
-**Variables en español** — detecta `CLAVE_`, `SECRETO_`, `CONTRASENA_`, `TOKEN_MP_`, `USUARIO_DB_` y docenas de variantes en castellano que los scanners anglosajones pasan por alto.
+**Encuentra lo que no ves** — contraseñas y claves API que quedaron hardcodeadas en el código, configuraciones inseguras, librerías con vulnerabilidades conocidas. Son los errores más comunes y los más costosos cuando los aprovecha un atacante.
 
-**7 stacks soportados** — Next.js, React, Node.js/Express, Python/FastAPI, WordPress, PHP genérico y sitios estáticos. La auditoría se adapta automáticamente al proyecto, sin configuración.
+**Habla el idioma de la región** — entiende pagos con MercadoPago, facturación electrónica AFIP/SAT/SII y datos sensibles como CUIT o DNI. No es un scanner genérico traducido: fue construido para el ecosistema latinoamericano.
 
-**Fix code incluido** — cada hallazgo crítico y alto incluye el fragmento de código corregido listo para aplicar. No solo se reporta el problema: se entrega la solución.
+**No necesitás ser experto** — una sola instrucción audita todo el proyecto. El reporte explica cada problema en lenguaje claro con la solución lista para aplicar.
 
-**Checklist pre-deploy** — al final de cada auditoría se genera una checklist específica para el stack detectado. Saber qué revisar antes de ir a producción, sin depender de la memoria.
+**Cobertura profesional** — sigue los estándares internacionales OWASP y CWE que usan los equipos de seguridad de grandes empresas. La misma rigurosidad, al alcance de cualquier equipo.
 
 ## Autor
 
