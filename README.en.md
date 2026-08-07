@@ -39,6 +39,8 @@ Auditron detects the project type and adapts the audit accordingly:
 | Generic PHP | `*.php`, `composer.json` | composer audit, injection |
 | Static site | HTML/CSS/JS only | frontend secrets, headers |
 
+This detection covers the frontend framework only. If the project also uses Supabase, Firebase, or has payments/subscriptions, Auditron runs those audits **in addition** to whatever stack was detected — a React project with Supabase gets the full React analysis *and* the database privilege audit.
+
 ### Security coverage
 
 **Full OWASP 2025 Top 10:**
@@ -89,6 +91,34 @@ Auditron detects the project type and adapts the audit accordingly:
 - CUIT/CUIL/DNI exposure in code or API responses
 - Electronic invoicing: AFIP (Argentina), SAT (Mexico), SII (Chile)
 - Unobfuscated Spanish-language environment variables
+
+**Backend-as-a-Service — Supabase / Firebase (real privilege audit, not just code):**
+- Postgres RLS policies evaluated against the app's actual roles (admin/staff/customer, free/pro) — catches the moment a "fine between coworkers" broad access becomes a PII leak once an external role (customers, end users) joins the same auth pool
+- `SECURITY DEFINER` functions: detects privilege escalation from misconfigured execution grants (including the implicit `PUBLIC` grant Postgres applies by default, which a partial `REVOKE` doesn't close)
+- Missing `search_path` pinning on elevated-privilege functions (hijacking)
+- Public storage buckets holding private user files
+- Edge Functions with JWT verification disabled
+- Firestore/Firebase Storage rules equivalent to `USING(true)`
+- Optional live-verification technique (requires explicit permission): simulates low-privilege sessions against the real database to confirm a closed finding actually stayed closed
+
+**SaaS, marketplaces & monetization (freemium, subscriptions, user-to-user sales):**
+- Paywalls/premium features checked only client-side (bypassable by calling the API directly)
+- Checkout amount or plan trusted from the client instead of computed server-side
+- Payment webhooks with no replay protection (double-crediting) or that ignore a failed signature check
+- Paid digital assets served via permanent public URLs instead of short-lived signed ones
+- Free-trial / disposable-account abuse with no durable identity check
+- "Wallet attacks" — costly features (AI, rendering) with no server-side per-user usage cap
+- Marketplaces: seller commission/payout computed client-side
+- Multi-tenant isolation: tenant/organization must come from the session, never a URL/body parameter
+
+**Advanced & less common vectors (but real):**
+- JWT algorithm confusion (RS256/HS256)
+- IDOR via sequential/enumerable IDs
+- Excessive data exposure (`SELECT *` returned as-is to the client)
+- Session fixation, CSRF on state-changing GET requests
+- User enumeration via differing messages/response times
+- Prototype pollution, ReDoS, dependency confusion, OAuth open redirect
+- GraphQL: introspection left on in production, missing depth/complexity limits
 
 ### Security headers
 Reviews and generates configuration for:

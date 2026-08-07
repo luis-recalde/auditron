@@ -39,6 +39,8 @@ Auditron detecta el tipo de proyecto y adapta la auditoría:
 | PHP genérico | `*.php`, `composer.json` | composer audit, injection |
 | Sitio estático | Solo HTML/CSS/JS | secrets en frontend, headers |
 
+Esta detección es solo del framework de frontend. Si el proyecto además usa Supabase, Firebase, o tiene pagos/suscripciones, Auditron corre esas auditorías **además**, sin importar qué stack haya detectado — un proyecto React con Supabase recibe el análisis de React completo *y* la auditoría de privilegios de base de datos.
+
 ### Cobertura de seguridad
 
 **OWASP 2025 Top 10 completo:**
@@ -89,6 +91,34 @@ Auditron detecta el tipo de proyecto y adapta la auditoría:
 - Exposición de CUIT/CUIL/DNI en código o respuestas
 - Facturación electrónica: AFIP, SAT, SII
 - Variables de entorno en español sin ofuscar
+
+**Backend-as-a-Service — Supabase / Firebase (auditoría de privilegios reales, no solo código):**
+- Políticas RLS de Postgres evaluadas contra los roles reales de la app (admin/staff/cliente, free/pro) — detecta cuándo un acceso "aceptable entre compañeros de trabajo" se convierte en una fuga de PII al agregar un rol externo (clientes, usuarios finales)
+- Funciones `SECURITY DEFINER`: detecta escalación de privilegios por permisos de ejecución mal configurados (incluyendo el `GRANT` implícito a `PUBLIC` que Postgres aplica por defecto y que un `REVOKE` parcial no cierra)
+- `search_path` sin fijar en funciones con privilegios elevados (hijacking)
+- Buckets de Storage públicos con archivos privados de usuarios
+- Edge Functions con verificación de JWT deshabilitada
+- Reglas de seguridad de Firestore/Firebase Storage equivalentes a `USING(true)`
+- Técnica de verificación en vivo (opcional, con permiso explícito): simula sesiones de bajo privilegio contra la base real para confirmar que un hallazgo cerrado realmente quedó cerrado
+
+**SaaS, marketplaces y monetización (freemium, suscripciones, venta entre usuarios):**
+- Paywalls/features pagas verificadas solo en el frontend (bypasseables llamando la API directo)
+- Monto o plan de checkout confiado desde el cliente en vez de calculado en el servidor
+- Webhooks de pago sin protección contra reenvío (doble acreditación) o que ignoran una firma inválida
+- Assets digitales pagos servidos con URLs públicas permanentes en vez de firmadas y expirables
+- Abuso de prueba gratuita / cuentas desechables sin verificación de identidad durable
+- Ataques de "billetera" — funciones costosas (IA, render) sin límite de uso por usuario del lado del servidor
+- Marketplaces: comisión/payout del vendedor calculado del lado del cliente
+- Aislamiento multi-tenant: el tenant/organización debe derivarse de la sesión, nunca de un parámetro de la URL
+
+**Vectores avanzados y menos comunes (pero reales):**
+- Confusión de algoritmo JWT (RS256/HS256)
+- IDOR por IDs secuenciales/enumerables
+- Exposición excesiva de datos (`SELECT *` devuelto tal cual al cliente)
+- Fijación de sesión, CSRF en peticiones GET que mutan estado
+- Enumeración de usuarios por mensajes/tiempos de respuesta distintos
+- Prototype pollution, ReDoS, dependency confusion, open redirect en flujos OAuth
+- GraphQL: introspección en producción, falta de límite de profundidad/complejidad
 
 ### Headers de seguridad
 Revisa y genera configuración para:

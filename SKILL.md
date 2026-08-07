@@ -40,6 +40,8 @@ Classify the project. Use the first match:
 
 Announce: `Stack detectado: [STACK]. Adaptando auditoría...`
 
+**Backend-as-a-Service is an orthogonal layer, not a Phase 1 category.** A project is classified above by its *frontend/framework* stack, but separately check for a BaaS backend (Supabase, Firebase) or a monetization layer (payments, subscriptions, marketplace) — these trigger Phase 4 and Phase 5 respectively regardless of which row matched above. A `REACT` project with `@supabase/supabase-js` in its dependencies is still `REACT` for Phase 1 purposes, but it also gets the full Phase 4 database-privilege audit — never skip Phase 4/5 just because the project matched a frontend-only row here.
+
 ---
 
 ## PHASE 2 — SECRET SCANNING (70+ patterns)
@@ -622,7 +624,337 @@ function validateUrl(userUrl: string): string {
 
 ---
 
-## PHASE 4 — CWE TOP 25 (by language)
+## PHASE 4 — BACKEND-AS-A-SERVICE & DATABASE PRIVILEGE AUDIT (Supabase / Firebase / PostgREST)
+
+**Why this phase exists:** every other phase in this skill reads source code. This phase reads the *backend's own privilege model* — Postgres RLS policies, `GRANT`s, `SECURITY DEFINER` functions, Firebase security rules. These vulnerabilities are invisible to grep because the vulnerable object (a policy, a grant) lives in the database or the BaaS console, not in a `.ts` file. A project can pass every other phase with a perfect score and still hand out admin access through a single unguarded RPC call. This phase was added after a real production audit where exactly that happened: a `SECURITY DEFINER` function with no internal permission check was reachable by any logged-in user and could mint new admin accounts on demand — zero findings from source-code review, confirmed only by testing live database privileges.
+
+**Trigger this phase when ANY of:**
+```
+Glob: supabase/config.toml, supabase/schema.sql, supabase/migrations/**
+Grep in package.json deps: "@supabase/supabase-js"
+Glob: firestore.rules, storage.rules, database.rules.json
+Grep in package.json deps: "firebase", "firebase-admin"
+Grep in package.json deps: "@prisma/client" + Glob: **/*.sql          (raw SQL access pattern)
+```
+If none match, skip this phase and note: `Sin backend BaaS/RLS detectado — fase omitida.`
+
+This phase composes with ANY frontend stack from Phase 1 — a REACT or NEXTJS project can also be a Supabase project. Detecting Supabase does not change the Phase 1 classification; it adds this phase on top.
+
+### 4.1 — Get the real schema, not just the code
+
+The repo's `supabase/schema.sql` is often stale (teams forget to regenerate it after making changes in the Supabase Studio SQL editor directly). If the project has the Supabase CLI available and is linked (`supabase status` or a `project_id` in `supabase/config.toml`), prefer a live dump over the committed file:
+```bash
+npx supabase db dump --linked -s public -f /tmp/audit_schema.sql
+```
+If this isn't possible (no CLI, no credentials, read-only audit), fall back to `supabase/schema.sql` and **explicitly flag in the report** that findings in this phase are only as current as that file — recommend the user re-run `db dump` to confirm.
+
+### 4.2 — Map the app's own role model first
+
+Before judging any policy, find out if this project has more than one trust level sharing the same Postgres `authenticated` role. Supabase Auth (and Firebase Auth) only has one generic "logged in" role at the database-connection level — app-level roles (admin/staff/customer, free/paid, tenant A/tenant B) live in a table column, not in Postgres/Firebase roles.
+```
+Grep: CREATE TABLE.*(profiles|perfiles|users|usuarios).*\(
+Grep: rol\s+"?text"?|role\s+"?text"?|CHECK.*rol.*=.*ANY.*ARRAY   # role/tier column + allowed values
+Grep: is_admin\(\)|is_staff\(\)|has_role\(|auth\.jwt\(\)\s*->>\s*'role'
+```
+List every distinct role/tier value found (e.g. `admin`, `asesor`, `cliente`, or `free`, `pro`, `creator`). This list is the yardstick for every check below — a policy that's fine when only `admin`/`staff` share `authenticated` becomes a leak the moment a lower-trust role (customer, free-tier user, external portal) joins the same pool.
+
+### 4.3 — RLS enabled on every table
+
+```
+Grep: CREATE TABLE (list all)
+Grep: ALTER TABLE .* ENABLE ROW LEVEL SECURITY (list all)
+```
+Any table in the first list missing from the second is **CRITICAL** — with RLS off, the table is readable/writable by anyone holding the anon key, full stop, regardless of any policy text.
+
+### 4.4 — Overly broad policies exposed to the WRONG role
+
+```
+Grep: USING\s*\(\s*true\s*\)
+Grep: USING\s*\(\s*\(?"?auth"?\."?role"?\(\)\s*=\s*'authenticated'
+Grep: TO\s+"?anon"?\s+.*FOR SELECT
+```
+For each match, identify the table and ask: **does every role from 4.2 legitimately need this data?** A `USING(true)` on a pure catalog/inventory table (price lists, public listings) is fine — flag as informational. A `USING(true)` on a table with PII (names, national ID numbers, phone, email, addresses, payment history) or business-sensitive data (other users'/other tenants'/other creators' records) is **CRITICAL** the moment more than one trust level shares `authenticated`. This is true even if the broad access was an accepted tradeoff for the higher-trust roles (e.g. staff needs to search all customers to avoid duplicates) — the fix is never "leave it open," it's `USING (is_staff() OR owner_id = auth.uid())`, scoping by the caller's own identity for the lower-trust role while preserving the original access for the higher-trust one.
+
+**Also check `FOR ALL` policies specifically — including the implicit form.** In Postgres, `CREATE POLICY name ON table TO role USING (...)` with **no `FOR` clause at all defaults to `FOR ALL`**. This implicit form is the more common one in real schemas (people write `TO authenticated USING (...)` and never realize they skipped specifying the command), so a pattern that only matches the literal text `FOR ALL` will miss most real instances — verified against a real production schema while writing this phase, where every actual "FOR ALL" policy in the file omitted the keyword entirely and the literal-text pattern matched zero of them.
+```
+Grep: CREATE POLICY.*FOR ALL                                          # explicit form
+Grep: CREATE POLICY\s+"[^"]+"\s+ON\s+\S+\s+TO\s+"?\w+"?\s+USING       # implicit form — no FOR keyword between the table and TO/USING
+```
+For every match from either pattern, confirm there's also an explicit, separately-scoped `FOR SELECT` policy on the same table — if not, the "write-only" policy is actually granting full read access as a side effect. Note this can be a **false positive when harmless**: if the `USING`/gating condition already restricts the policy to a trusted role only (e.g. `is_admin()`), and no lower-trust role can satisfy that same condition, the implicit read grant doesn't create a new leak — still flag it (as **LOW**, not CRITICAL, in that case) and recommend splitting it explicitly, since it's fragile: the moment that gating function's logic changes or a new role is added, the implicit SELECT grant becomes a live leak with no additional code change needed to trigger it.
+
+**Also check that `WITH CHECK` is explicit on every INSERT/UPDATE policy, not implied from `USING`.** When `WITH CHECK` is omitted on an UPDATE policy, Postgres reuses the `USING` expression to validate the new row too — this is *usually* safe, but only when the `USING` condition doesn't depend on a column value the policy itself allows the caller to change (e.g. a self-service `owner_id = auth.uid()` policy is fine because tampering with `owner_id` on the new row would fail that same check; a role/tier/`is_admin` flag stored on the same row the user can otherwise self-update is not, since the check may pass on both the old and attacker-modified new row). Read each UPDATE/INSERT policy's actual condition against the columns that specific table's `UPDATE`/`INSERT` statements in the app are allowed to set — don't flag every missing `WITH CHECK` as critical by pattern alone, but always call out tables where a self-service update policy coexists with a sensitive, self-settable column (role, price, `is_admin`, `verified`, discount %) as **HIGH**, and recommend an explicit `WITH CHECK` that pins those specific columns to their existing value.
+
+### 4.5 — `SECURITY DEFINER` functions: the privilege-escalation class
+
+This is the highest-value check in this phase. `SECURITY DEFINER` functions run with the privileges of whoever created them (usually the Postgres superuser), bypassing RLS entirely. Postgres also grants `EXECUTE` to `PUBLIC` on every new function **by default** — an explicit `REVOKE` is required to close it, and teams routinely forget this even after revoking from `authenticated` specifically (revoking from one role does nothing if `PUBLIC` still has it — verify both).
+
+```
+Grep: SECURITY DEFINER                              # list every such function
+Grep: GRANT ALL ON FUNCTION|GRANT EXECUTE ON FUNCTION
+```
+For each `SECURITY DEFINER` function found:
+1. **Read the function body.** Does it perform a sensitive action (create/modify a user, change a role, touch another user's row, move money, issue a refund/payout)?
+2. **Check its grants** — who can call it? A function reachable by `anon`/`authenticated`/`PUBLIC` that does something sensitive AND has no internal check of the caller's own identity/role (no `auth.uid()`, no `is_admin()`, no ownership comparison inside the function body) is **CRITICAL** — this is a direct, unauthenticated-in-spirit privilege escalation. Any authenticated session (including the lowest-trust role from 4.2) can call it via `supabase.rpc('function_name', {...})` or the PostgREST `/rest/v1/rpc/<name>` endpoint directly, with attacker-controlled parameters, regardless of whether the frontend code ever calls it — **dead code with a live grant is still exploitable.**
+3. **Check for `SET search_path`** — a `SECURITY DEFINER` function without a pinned `search_path` (`SET "search_path" TO 'public', 'pg_temp'` or similar) is vulnerable to search-path hijacking: an attacker who can create objects in a schema earlier in the resolution path can shadow a table/function the definer-privileged function calls internally by an unqualified name, achieving code execution as the definer. **Severity depends on whether the function body actually contains unqualified references** — read the body, don't just check for the missing `SET`: if every table/function reference inside is already schema-qualified (`public.table_name`, not bare `table_name`), there is no ambiguous name for an attacker to shadow, and the missing `SET search_path` is a **LOW**/hygiene finding (recommend adding it anyway, as insurance against future edits that introduce an unqualified reference — cheap to fix, easy to regress). If the body has even one unqualified reference, flag as **HIGH** — that's the actual exploitable case.
+
+**Fix pattern:**
+```sql
+-- Remove the escalation vector — revoke from BOTH roles, PUBLIC included:
+REVOKE ALL ON FUNCTION public.fn_name(args) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.fn_name(args) FROM authenticated;
+-- If the function must remain callable by end users, add an internal guard instead of an open grant:
+CREATE OR REPLACE FUNCTION public.fn_name(...)
+  SECURITY DEFINER
+  SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF NOT public.is_admin() THEN
+    RAISE EXCEPTION 'permission denied';
+  END IF;
+  -- ... original logic
+END;
+$$ LANGUAGE plpgsql;
+```
+
+**Verifying the fix (do this before marking CRITICAL findings closed):** if the auditor has a live, linked, non-production-critical way to test (explicit user permission required — never do this against a real project without asking first), the most reliable proof is a real RLS-respecting simulation, not just reading the policy text:
+```sql
+-- Run via `supabase db query --linked` (or psql) — this actually enforces RLS/GRANTs,
+-- unlike inspecting the SQL text alone:
+SET ROLE authenticated;
+SET request.jwt.claim.sub = '<a real or disposable low-trust user id>';
+SELECT * FROM sensitive_table;              -- should return 0 rows / only own rows
+SELECT public.fn_name('attacker-controlled-args');  -- should raise permission denied
+RESET ROLE;
+```
+If disposable test accounts are created for this, **always clean them up** (`DELETE FROM auth.users WHERE email = '...'`, cascades to profile tables) before closing the audit — never leave synthetic accounts in a production database.
+
+### 4.6 — Storage buckets & file access
+
+**The bucket's public/private flag is data, not schema — it will NOT appear in the `-s public` schema dump from 4.1.** `storage.buckets.public` is a row value in the `storage` schema, which a `public`-only DDL dump never touches. Query it directly instead (verified working method):
+```bash
+npx supabase db query --linked "SELECT id, name, public FROM storage.buckets;"
+```
+Cross-reference every bucket's `public` value against what's actually stored in it, from the app code:
+```
+Grep: storage\.from\(['"]?(\w+)['"]?\)\.upload            # which bucket receives which kind of file
+Grep: createBucket\(.*public.*true                         # bucket created as public in code, if applicable
+```
+A bucket with `public: true` is only a finding if what it stores is sensitive — **not every public bucket is a bug**: logos, marketing images, and public floor-plan renders are fine public by design. A bucket holding user-uploaded ID scans, contracts, invoices, or paywalled digital assets (Phase 5.7) marked `public: true` is **CRITICAL** — anyone with the object's URL (often guessable/sequential) can read it with no auth at all. Read what the corresponding `upload()` call in the app actually stores before deciding severity.
+
+### 4.7 — Edge Functions / serverless functions bypassing auth
+
+```
+Glob: supabase/functions/**/index.ts
+Grep in supabase/config.toml: verify_jwt\s*=\s*false
+```
+A function with `verify_jwt = false` skips Supabase's automatic JWT check entirely — acceptable only for genuinely public endpoints (e.g. public webhooks that verify their own signature instead, like Stripe/MercadoPago). If a `verify_jwt = false` function performs a privileged action (creates users, touches payment state, mutates another user's data) without its own internal auth check in the function body, flag as **CRITICAL**.
+
+### 4.8 — Firebase equivalent (when Firebase, not Supabase, is detected)
+
+```
+Grep in firestore.rules / storage.rules: allow (read|write).*if true;
+Grep: allow read, write: if request.auth != null;    # "any logged in user" — same class as USING(true)
+```
+Same reasoning as 4.4: `if request.auth != null` alone means ANY authenticated user, not "the owner" or "the right role" — check it against the role list from 4.2. Also check Cloud Functions `onCall`/`onRequest` handlers for missing `context.auth` / `request.auth` checks before performing writes.
+
+---
+
+## PHASE 5 — SAAS, MARKETPLACE & MONETIZATION SECURITY (freemium, subscriptions, in-app purchases, creator marketplaces)
+
+**Trigger this phase when ANY of:** the project has a pricing/plan model (free vs. paid tiers), a marketplace where users sell to other users (asset stores, game/creator marketplaces), subscriptions, or any payment integration (Stripe, MercadoPago, PayPal, in-app purchase).
+```
+Grep in package.json deps: "stripe", "@stripe/", "mercadopago", "paypal"
+Grep: subscription|plan_id|tier|premium|is_pro|isPaid|free_trial
+Glob: **/webhooks/**, **/api/stripe/**, **/api/checkout/**
+```
+
+The vulnerabilities in this phase are almost never "missing auth" — they're **business logic trusting the client**. A user who is authenticated as themselves (no privilege escalation needed) manipulates a request to get something they didn't pay for. These are consistently under-tested because they require thinking like a paying customer trying to avoid paying, not like an attacker looking for a broken auth check.
+
+### 5.1 — Client-side-only entitlement / paywall bypass (the #1 real-world finding in this category)
+
+This one doesn't reduce to a single reliable regex — the vulnerable shape varies too much (an `if`, a ternary, a `disabled` prop, a route guard) for a pattern to catch consistently, and testing against realistic snippets while writing this phase confirmed an over-specific regex here just returns zero matches on real code shaped slightly differently. Use these as **candidate anchors** to find where to look, not as the check itself:
+```
+Grep: isPro|isPremium|hasSubscription|user\.(plan|tier)                  # any file mentioning a plan/tier flag at all
+```
+For every file that matches, find where that flag actually gates something, then trace forward: **does the backend endpoint that returns the paid feature/asset/export/API result independently verify the caller's current entitlement server-side**, or does it just serve the data because the request arrived? If the only thing standing between a free user and a paid feature is a `disabled` prop or an `if (user.isPro)` in React — with no matching check in the API route/server action it calls — it's **CRITICAL**: trivially bypassed by calling the API directly (devtools, curl) with a valid free-tier session token. This requires reading the actual client→server round trip, not just the frontend file in isolation.
+
+**Fix pattern:**
+```typescript
+// BAD — trusts a client-sent or client-derived flag
+export async function POST(req: Request) {
+  const { isPro } = await req.json()   // or reads req.user.isPro from a JWT claim set at login that's now stale
+  if (isPro) return exportPremiumReport()
+}
+
+// GOOD — re-checks entitlement server-side, from the source of truth, on every privileged call
+export async function POST(req: Request) {
+  const session = await getServerSession(authOptions)
+  const sub = await db.subscription.findUnique({ where: { userId: session.user.id } })
+  if (!sub || sub.status !== 'active' || sub.currentPeriodEnd < new Date()) {
+    return Response.json({ error: 'Requiere plan pago' }, { status: 402 })
+  }
+  return exportPremiumReport()
+}
+```
+
+### 5.2 — Price / amount / plan tampering at checkout
+
+```
+Grep: amount\s*[:=]\s*req\.(body|query)|price\s*[:=]\s*req\.(body|query)
+Grep: stripe\.checkout\.sessions\.create\(\{[^}]*amount\s*:\s*(body|req)
+```
+If the checkout/order-creation endpoint accepts `amount`, `price`, or `plan_id` from the client and uses it directly to create the charge, a user can pay $0.01 for anything. The backend must look up the price from its own price table/Stripe Price ID, keyed only by a product/plan identifier — never trust a client-sent amount.
+
+### 5.3 — Payment webhook integrity (signature + replay)
+
+Beyond just "is the signature checked" (already covered in Phase 9 for MercadoPago) — two more common gaps:
+```
+Grep: stripe\.webhooks\.constructEvent          # present = good, check it's actually used before processing
+Grep: (webhook|event)\.id.*(processed|seen|idempotenc)  # idempotency/replay check
+```
+- **No idempotency check** on payment-confirmed webhooks → an attacker (or a retried delivery from the provider itself, which is normal and expected) that replays the same event can double-credit an account, double-grant a purchased item, or double-extend a subscription. Flag as **HIGH** if there's no check that the event ID was already processed before granting the entitlement.
+- **Webhook handler grants access before verifying the signature**, or verifies it but doesn't `return`/`throw` on failure (verifies-then-ignores-the-result is a real, recurring bug). Flag as **CRITICAL**.
+
+### 5.4 — Subscription/entitlement race on cancel-and-reuse
+
+Check whether canceling a subscription immediately revokes access or only revokes it at `current_period_end`. Neither is wrong on its own, but the code must be internally consistent — if cancellation immediately flips `isPro = false` while Stripe still considers the period active (or vice versa), users can exploit the gap. Also check for a downgrade path that doesn't clear out usage tied to the higher tier (e.g. a free-tier user who was briefly Pro keeps Pro-tier resource limits forever because the limit was cached at creation time, not re-checked).
+
+### 5.5 — Free-trial / free-tier abuse (no durable identity check)
+
+```
+Grep: (?i)trial|free_tier|freeTier|first_?time_?user
+```
+If trial eligibility is checked only against the current account/email, a user can create unlimited accounts (disposable emails, `+1`/`+2` Gmail aliases) to get unlimited free trials or repeatedly claim a one-per-user free credit grant. This is rarely "critical" but is a real, common revenue-leak finding — flag as **MEDIUM** and note it as a business-risk item, not just a security one.
+
+### 5.6 — Marketplace-specific: creator payout & commission tampering
+
+Applies directly to any project where users sell to other users (asset marketplaces, game/creator stores, plugin marketplaces):
+```
+Grep: commission|payout|seller_amount|creator_share
+```
+If the commission percentage or the seller's payout amount is computed anywhere in client-controllable input (rather than derived server-side from a fixed rate at the time of sale), a seller can manipulate their own payout upward. Also check that a buyer cannot mark their own transaction as refunded/completed without going through the actual payment provider's confirmation.
+
+### 5.7 — Digital asset / paid-content protection (DRM-adjacent)
+
+```
+Grep: signedUrl|getSignedUrl|expiresIn
+Grep: <a\s+href=.*\/(assets|downloads|exports)\/.*\.(zip|pdf|unitypackage|glb)
+```
+If paid digital assets (game asset packs, exported files, premium templates) are served via a permanent, unauthenticated, or long-lived public URL rather than a short-lived signed URL re-issued after an entitlement check, the URL can be shared/leaked to bypass payment entirely, and search engines or link-sharing can expose it publicly. Flag as **HIGH**. Recommend signed URLs with short expiry (minutes, not days) re-generated per authorized request.
+
+### 5.8 — Usage-based abuse / "wallet attack" on metered AI or compute features
+
+Applies to any feature that calls a paid third-party API (AI generation, image/video rendering, SMS, email) per user action:
+```
+Grep: openai\.|anthropic\.|generateImage|generateVideo — check for per-user rate limiting nearby
+```
+If a free-tier (or even paid-tier) user can trigger unlimited calls to an expensive backend operation with no per-user/per-IP rate limit or daily quota enforced server-side, an attacker can run up the project owner's third-party bill arbitrarily ("wallet attack" / denial of wallet) even without breaking any data confidentiality. Flag as **HIGH** if a metered/costed operation has no server-side quota check independent of the frontend UI's own throttling.
+
+### 5.9 — Multi-tenant / multi-creator data isolation
+
+```
+Grep: WHERE.*=\s*req\.(params|body|query)\.(tenant|org|account|creator)Id   # raw SQL — tenant id taken from request instead of session
+Grep: (tenant|org|account|creator)Id:\s*req\.(params|body|query)            # ORM style (Prisma/Drizzle/Kysely) — matches `where: { tenantId: req.params.tenantId }`, the more common real-world shape in JS/TS backends
+Grep: \.findUnique\(\{\s*where:\s*\{\s*id:\s*(req\.|params\.)               # missing owner/tenant filter entirely
+```
+Every query for a resource scoped to a tenant/organization/creator must filter by the tenant ID derived from the **authenticated session**, never from a client-supplied `tenantId`/`orgId` parameter (trivial to swap for another tenant's ID otherwise — a direct IDOR at the tenant level, worse than a single-record IDOR because it can expose an entire other business's data: their users, their sales, their analytics). Flag as **CRITICAL**.
+
+---
+
+## PHASE 6 — ADVANCED & RARE ATTACK VECTORS
+
+These are lower-frequency but well-documented, real vulnerability classes that don't fit cleanly into the OWASP Top 10 buckets above. Check for them on every audit regardless of stack; skip silently (no need to report "not applicable") when a pattern genuinely can't apply (e.g. GraphQL checks on a project with no GraphQL layer).
+
+### 6.1 — JWT algorithm confusion
+
+**Ripgrep doesn't support lookaround** (`(?!...)`) — don't write a pattern that depends on it, it will silently match nothing and look like a clean bill of health. Grep for the anchor, then read each result to judge the negative condition:
+```
+Grep: jwt\.verify\(                                   # every call site — read each one
+Grep: jwt\.verify\(.*algorithms\s*:\s*\[.*(RS256.*HS256|HS256.*RS256)
+```
+If `jwt.verify()` is called without an explicit `algorithms: [...]` allowlist, or with both `RS256` and `HS256` accepted, an attacker who knows the RS256 public key (often published, e.g. at a `/.well-known/jwks.json` endpoint or embedded in the frontend) can forge a token signed with HS256 using the public key as the HMAC secret — the library will accept it as valid. **CRITICAL.** Fix: always pass an explicit single-algorithm allowlist matching what the issuer actually uses.
+
+### 6.2 — IDOR via enumerable identifiers
+
+```
+Grep: id\s+(SERIAL|INTEGER|BIGINT)\s+PRIMARY KEY      # auto-increment PK — check if that table's id is ever used in a public URL/route
+Grep: /:(id|invoiceId|orderId|userId)\b               # route params — cross-reference each against the schema: is the underlying column a serial/int or a uuid?
+```
+Beyond "is there an ownership check" (Phase 3, A01) — even WITH an ownership check, using sequential integer IDs as public-facing identifiers (`/invoice/1042`, `/order/883`) lets an attacker infer the existence and approximate volume of other users' records, and turns any future ownership-check regression into full enumeration. Recommend UUIDs (or ULIDs if ordering matters) for any publicly-referenced resource ID.
+
+### 6.3 — Excessive data exposure in API responses
+
+```
+Grep: \.select\(\s*['"]?\*|SELECT \*                            # explicit wildcard projection
+Grep: \.findMany\(\)\s*$|\.findMany\(\)\s*[;,)]                 # Prisma findMany() called with no arguments at all — no select/include, returns full rows by default
+Grep: res\.json\(user\)|res\.json\(req\.user\)                  # returning a full user object as-is
+```
+An endpoint that returns an entire database row (via `SELECT *` or an ORM call with no field projection) commonly leaks fields never meant for the client: password hashes, internal flags, other users' foreign keys, soft-delete markers, admin notes. This is a real, frequent finding independent of whether the frontend happens to only display some of the fields — the full object is still visible in devtools/network tab. Flag as **MEDIUM**–**HIGH** depending on what's actually in the leaked fields (password hash present = CRITICAL).
+
+### 6.4 — Session fixation
+
+```
+Grep: (login|signIn|authenticate).*\(req|Grep: req\.session\.\w+\s*=      # find login handlers / session writes
+Grep: \.regenerate\(                                                       # find regenerate() calls
+```
+Locate the login handler (first pattern), then check with `-A 15` context (or read the surrounding function) whether it calls `req.session.regenerate()` (Express) or the framework's equivalent **before** writing the authenticated user into the session. If a login handler sets session data but no `regenerate()` call appears anywhere in the same file, the session ID likely isn't rotated on login — an attacker who fixes a victim's pre-login session ID (e.g. via a shared link containing a session cookie) can hijack the now-authenticated session. Flag as **HIGH**.
+
+### 6.5 — CSRF on state-changing GET requests
+
+```
+Grep: (app|router)\.get\(['"].*\/(delete|remove|update|approve|cancel)   # state-changing action bound to GET
+```
+Any endpoint that mutates state (delete, cancel, approve, unsubscribe) and responds to `GET` is CSRF-exploitable via a plain `<img src=...>` or link — no JS, no CORS restrictions apply to simple GET navigation. Should be `POST`/`DELETE` behind CSRF protection. Flag as **HIGH**.
+
+### 6.6 — Timing / message-based user enumeration
+
+```
+Grep: (User|Usuario) not found|Invalid (email|password|credentials) — check if login/reset-password returns DIFFERENT messages for "no such user" vs "wrong password"
+```
+A login or password-reset flow that says "no existe esa cuenta" vs. "contraseña incorrecta" lets an attacker enumerate valid emails/usernames at scale. Fix: always return the same generic message ("credenciales inválidas") and, ideally, similar response timing, regardless of which check failed.
+
+### 6.7 — Prototype pollution (JavaScript)
+
+```
+Grep: _\.merge\(|_\.defaultsDeep\(|Object\.assign\(\s*\{\s*\}\s*,.*req\.body
+Grep: \[.*req\.(body|query|params).*\]\s*=              # dynamic key assignment from user input
+```
+Deep-merging user-controlled input (`lodash.merge`, hand-rolled recursive merge, dynamic bracket-notation assignment) without blocking `__proto__`/`constructor`/`prototype` keys can pollute `Object.prototype` globally, leading to app-wide logic corruption or, in some frameworks, RCE. Flag as **HIGH**. Fix: use `structuredClone` + explicit allow-listed fields, or a merge library with prototype-pollution protection (lodash ≥ 4.17.21 patched this for its own `merge`, but hand-rolled merges remain vulnerable).
+
+### 6.8 — ReDoS (catastrophic backtracking regex)
+
+```
+Grep: \([^)]*[+*]\)[+*]                                # nested quantifiers like (a+)+ or (a*)*
+Grep: RegExp\(.*req\.(body|query)                       # regex built from user input directly
+```
+A regex with nested quantifiers evaluated against attacker-controlled, adversarially-crafted input (especially in validation for emails, URLs, or "looks like X" checks) can hang the event loop for seconds to minutes on a short malicious string — a cheap single-request DoS. Flag as **MEDIUM**, **HIGH** if the vulnerable regex sits on an unauthenticated, public-facing endpoint (contact form, signup).
+
+### 6.9 — Dependency confusion
+
+```
+Grep in package.json: "name":\s*"@[a-z0-9-]+/     — check if that scope is actually reserved/private on npm
+```
+An internal/private package referenced with a scope that isn't actually registered as private on the public npm registry can be squatted by an attacker who publishes a malicious package under that exact name — if the build ever resolves to the public registry (misconfigured `.npmrc`, missing private registry auth), it installs the attacker's code instead. Verify `.npmrc` pins internal scopes to a private registry explicitly.
+
+### 6.10 — Open redirect via OAuth / return_to parameters
+
+```
+Grep: redirect_uri=|return_to=|next=.*req\.(query|params)
+res\.redirect\(req\.(query|body)\.(url|redirect|next|return_to)\)
+```
+An unvalidated `redirect_uri`/`return_to`/`next` parameter, especially in an OAuth flow, lets an attacker craft a legitimate-looking login link that redirects the victim (with a valid session/token in the URL fragment or query) to an attacker-controlled domain after authentication. Flag as **HIGH**. Fix: validate against an explicit allowlist of same-origin paths, never accept an absolute external URL.
+
+### 6.11 — GraphQL-specific (only if a GraphQL layer is detected)
+
+```
+Grep in deps: "graphql", "apollo-server", "graphql-yoga"
+Grep: introspection:\s*true                              # introspection left on in production
+```
+Check for: introspection enabled in production (exposes the entire schema, including unused/admin-only fields, to anyone), missing query depth/complexity limiting (a deeply nested query can cause exponential resolver calls — a DoS vector unique to GraphQL), and batching endpoints with no per-batch rate limiting (turns a rate limit on 1 request into unlimited effective requests per HTTP call).
+
+---
+
+## PHASE 7 — CWE TOP 25 (by language)
 
 ### JavaScript / TypeScript
 - **CWE-79** (XSS): `dangerouslySetInnerHTML`, `innerHTML =`, `document.write`, unescaped template literals in HTML
@@ -677,7 +1009,7 @@ eval\s*\(\$_                      # PHP eval injection
 
 ---
 
-## PHASE 5 — SECURITY HEADERS
+## PHASE 8 — SECURITY HEADERS
 
 Check the project's HTTP header configuration. Look in:
 - `next.config.js` / `next.config.ts` / `next.config.mjs`
@@ -760,7 +1092,7 @@ async def add_security_headers(request, call_next):
 
 ---
 
-## PHASE 6 — INFRASTRUCTURE & CONFIG REVIEW
+## PHASE 9 — INFRASTRUCTURE & CONFIG REVIEW
 
 ### .env file exposure
 ```
@@ -809,7 +1141,7 @@ on:\s*pull_request_target                # Dangerous event — can access secret
 
 ---
 
-## PHASE 7 — LATAM-SPECIFIC CHECKS
+## PHASE 10 — LATAM-SPECIFIC CHECKS
 
 ### MercadoPago
 ```
@@ -854,7 +1186,7 @@ function validateMPWebhook(req: Request): boolean {
 
 ---
 
-## PHASE 8 — DEPENDENCY AUDIT
+## PHASE 11 — DEPENDENCY AUDIT
 
 Run the appropriate command based on detected stack:
 
@@ -899,7 +1231,7 @@ composer audit 2>/dev/null
 
 ---
 
-## PHASE 9 — SCORING ENGINE
+## PHASE 12 — SCORING ENGINE
 
 Calculate score starting from 100. Apply deductions:
 
@@ -908,8 +1240,13 @@ CRITICAL findings:
   - Secret exposed (AWS/GCP/Stripe/DB credentials):  -25 each (max -50)
   - SQL/Command Injection:                           -20 each (max -40)
   - Auth bypass / broken access control:             -20 each (max -40)
+  - Privilege escalation via DB function/RPC grant:  -25 each (max -50)   [Phase 4.5]
+  - RLS/security-rule exposes data across roles      -20 each (max -40)   [Phase 4.4 / 4.8]
+    or tenants (multi-tenant isolation failure)
+  - Client-side-only paywall / entitlement bypass:   -20 each (max -40)   [Phase 5.1]
   - Insecure deserialization:                        -15 each (max -30)
   - CRITICAL CVE in dependency:                      -15 each (max -30)
+  - JWT algorithm confusion (no alg allowlist):      -20 each (max -40)   [Phase 6.1]
 
 HIGH findings:
   - Hardcoded credentials (non-production):          -10 each (max -20)
@@ -917,6 +1254,19 @@ HIGH findings:
   - Missing auth on sensitive endpoint:              -10 each (max -20)
   - SSRF vulnerability:                              -10 each (max -20)
   - HIGH CVE in dependency:                          -8 each (max -16)
+  - RLS disabled on a table (no policy evaluated):   -12 each (max -24)   [Phase 4.3]
+  - SECURITY DEFINER function missing SET            -8 each (max -16)   [Phase 4.5]
+    search_path (hijacking risk):
+  - Public storage bucket with private user files:   -12 each (max -24)   [Phase 4.6]
+  - Payment webhook: no signature check or           -12 each (max -24)   [Phase 5.3]
+    no replay/idempotency protection:
+  - Unprotected digital asset URL (paywall bypass    -10 each (max -20)   [Phase 5.7]
+    via direct link):
+  - Price/amount trusted from client at checkout:    -12 each (max -24)   [Phase 5.2]
+  - Session fixation (no regenerate on login):       -8 each (max -16)    [Phase 6.4]
+  - CSRF-exploitable state change on GET:            -8 each (max -16)    [Phase 6.5]
+  - Prototype pollution via unguarded deep merge:    -10 each (max -20)   [Phase 6.7]
+  - Open redirect (OAuth/return_to):                 -8 each (max -16)    [Phase 6.10]
 
 MEDIUM findings:
   - Weak cryptography (MD5/SHA1 for passwords):      -5 each (max -10)
@@ -924,11 +1274,18 @@ MEDIUM findings:
   - CORS misconfiguration:                           -5 each (max -10)
   - Debug mode in production signals:                -5 (flat)
   - MODERATE CVE in dependency:                      -3 each (max -9)
+  - Excessive data exposure (SELECT * to client):    -5 each (max -10)    [Phase 6.3]
+  - Free-trial/free-tier abuse (no durable check):   -5 each (max -10)    [Phase 5.5]
+  - Timing/message-based user enumeration:           -4 each (max -8)     [Phase 6.6]
+  - ReDoS-prone regex on public endpoint:            -5 each (max -10)    [Phase 6.8]
+  - Broad USING(true)/anon-readable policy on        -5 each (max -10)    [Phase 4.4]
+    non-sensitive catalog data (informational risk):
 
 LOW findings:
   - Single missing security header:                  -2 each (max -8)
   - Non-sensitive info in logs:                      -2 each (max -4)
   - Minor misconfigurations:                         -2 each (max -4)
+  - Sequential/enumerable public resource IDs:       -2 each (max -6)     [Phase 6.2]
 
 Minimum score: 0
 ```
@@ -944,7 +1301,7 @@ Minimum score: 0
 
 ---
 
-## PHASE 10 — REPORT OUTPUT
+## PHASE 13 — REPORT OUTPUT
 
 Generate the report in this exact format:
 
@@ -1009,7 +1366,7 @@ RESUMEN
 
 ━━━━ CHECKLIST PRE-DEPLOY ━━━━━━━━━━━━━━━━━━━━━━━
 
-<stack-specific checklist — see Phase 11>
+<stack-specific checklist — see Phase 14>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   auditron | Luis Recalde | MIT 2026
@@ -1021,7 +1378,7 @@ If no findings at all in a category, write: `Sin hallazgos en esta categoría.`
 
 ---
 
-## PHASE 11 — PRE-DEPLOY CHECKLISTS
+## PHASE 14 — PRE-DEPLOY CHECKLISTS
 
 ### NEXTJS
 ```
@@ -1132,6 +1489,35 @@ PRE-DEPLOY CHECKLIST — Sitio Estático
 [ ] Source maps: no expuestos en producción
 ```
 
+### SUPABASE / FIREBASE (aplica junto con el checklist del frontend, no en su lugar)
+```
+PRE-DEPLOY CHECKLIST — Backend-as-a-Service
+[ ] RLS habilitada en TODAS las tablas (ninguna tabla nueva sin ALTER TABLE ... ENABLE ROW LEVEL SECURITY)
+[ ] Ninguna política usa USING(true) sobre datos sensibles si hay más de un rol/tier compartiendo "authenticated"
+[ ] Toda política FOR ALL tiene una política SELECT separada y más estricta (o se confirmó que no hace falta)
+[ ] Funciones SECURITY DEFINER: cada una revisada — ¿valida el rol/identidad de quien llama internamente?
+[ ] Funciones SECURITY DEFINER: GRANT revisado en authenticated Y en PUBLIC (Postgres otorga PUBLIC por default)
+[ ] Funciones SECURITY DEFINER: todas tienen SET search_path explícito
+[ ] Buckets de Storage con archivos privados/de usuario: NO marcados como public
+[ ] Edge Functions con verify_jwt = false: confirmado que son endpoints genuinamente públicos con su propia verificación
+[ ] Service role key: nunca en el bundle de frontend, solo en funciones server-side/edge
+[ ] Rate limiting de Supabase Auth (sign-in, sign-up, OTP): ajustado a un valor bajo, no el default
+[ ] Si el proyecto pasó por un rediseño reciente de schema.sql: se regeneró con `supabase db dump --linked`, no se confía en una copia vieja
+```
+
+### SAAS / MARKETPLACE / MONETIZACIÓN (aplica a proyectos con planes pagos, suscripciones o venta entre usuarios)
+```
+PRE-DEPLOY CHECKLIST — Monetización
+[ ] Todo endpoint que sirve contenido/feature pago re-verifica la suscripción activa server-side, no confía en un flag del cliente
+[ ] El monto/plan cobrado en checkout se deriva de una tabla de precios propia, nunca de un valor enviado por el cliente
+[ ] Webhooks de pago (Stripe/MercadoPago/PayPal): firma verificada Y se corta el flujo si falla (no solo se loguea)
+[ ] Webhooks de pago: protegidos contra reenvío/replay (idempotencia por event ID)
+[ ] Assets digitales pagos: servidos con URL firmada de corta duración, no un link público permanente
+[ ] Límites de uso en features costosas (IA, render, envío de SMS/email): aplicados server-side, no solo en la UI
+[ ] Si es marketplace: comisión/payout del vendedor se calcula server-side, no llega como input del cliente
+[ ] Si es multi-tenant: el tenant/organización se deriva de la sesión autenticada, nunca de un parámetro de la URL/body
+```
+
 ---
 
 ## EXECUTION NOTES
@@ -1146,3 +1532,7 @@ PRE-DEPLOY CHECKLIST — Sitio Estático
 8. **Language** — write the report in the same language the user used to invoke the skill (Spanish or English).
 9. **No hallazgos = good news** — if a section is clean, say so clearly: "Sin hallazgos. ✓"
 10. **Rotate first** — when reporting exposed secrets, always lead with "Rotar la credencial INMEDIATAMENTE" before any code fixes.
+11. **Never skip Phase 4/5 checks based on Phase 1 alone** — a BaaS backend or a monetization layer can sit behind any frontend stack. Actually run the trigger checks in Phase 4 and Phase 5 for every project; only write "fase omitida" after confirming none of the trigger signals matched, not by assumption.
+12. **Code review ≠ privilege review** — findings in Phase 4 (database privileges, RLS, GRANTs) cannot be fully confirmed by reading `schema.sql` alone if that file might be stale. Say so explicitly in the report when a live `supabase db dump --linked` wasn't possible, so the user knows the finding's confidence level.
+13. **Ask before testing live** — the live RLS-simulation technique in Phase 4.5 touches a real database (even if only `SELECT`/read-only `SET ROLE` simulation). Always get explicit user confirmation before running it against a production or otherwise live project, and always clean up any disposable test accounts created for the test before closing the audit.
+14. **Business logic over pattern-matching in Phase 5** — monetization/entitlement bugs rarely match a clean regex the way a hardcoded secret does. Read the actual request/response flow for checkout, webhook, and paywall-gated endpoints; a missing grep hit is not the same as "no finding" for this phase.
