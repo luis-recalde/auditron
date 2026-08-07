@@ -40,7 +40,7 @@ Classify the project. Use the first match:
 
 Announce: `Stack detectado: [STACK]. Adaptando auditoría...`
 
-**Backend-as-a-Service is an orthogonal layer, not a Phase 1 category.** A project is classified above by its *frontend/framework* stack, but separately check for a BaaS backend (Supabase, Firebase) or a monetization layer (payments, subscriptions, marketplace) — these trigger Phase 4 and Phase 5 respectively regardless of which row matched above. A `REACT` project with `@supabase/supabase-js` in its dependencies is still `REACT` for Phase 1 purposes, but it also gets the full Phase 4 database-privilege audit — never skip Phase 4/5 just because the project matched a frontend-only row here.
+**Backend-as-a-Service, workflow automation, monetization, and cloud infrastructure are orthogonal layers, not Phase 1 categories.** A project is classified above by its *frontend/framework* stack, but separately check for: a BaaS backend (Supabase, Firebase → Phase 4), n8n or another workflow-automation layer (→ Phase 5), a monetization layer (payments, subscriptions, marketplace → Phase 6), and Terraform/Kubernetes/cloud IAM config (→ Phase 8) — each triggers independently of which row matched above. A `REACT` project with `@supabase/supabase-js` in its dependencies is still `REACT` for Phase 1 purposes, but it also gets the full Phase 4 database-privilege audit; a project with no frontend framework at all but a `terraform/` directory still gets Phase 8. Never skip an orthogonal phase just because the project matched (or didn't cleanly match) a frontend-only row here.
 
 ---
 
@@ -759,7 +759,62 @@ Same reasoning as 4.4: `if request.auth != null` alone means ANY authenticated u
 
 ---
 
-## PHASE 5 — SAAS, MARKETPLACE & MONETIZATION SECURITY (freemium, subscriptions, in-app purchases, creator marketplaces)
+## PHASE 5 — WORKFLOW AUTOMATION SECURITY (n8n, Zapier/Make exports, iPaaS)
+
+**Trigger this phase when ANY of:**
+```
+Glob: **/*.json — check if it parses as a workflow export (top-level "nodes" + "connections" keys, or node "type" strings starting with "n8n-nodes-base.")
+Grep: n8n-nodes-base\.                      # node type strings — the strongest signal
+Grep in docker-compose.yml / .env*: N8N_
+```
+n8n workflows usually live in the n8n instance itself, not the git repo — if no exported workflow JSON is found in the project files but `N8N_*` env vars or an n8n Docker service are present, note that this phase could only check instance-level config from what's in the repo, and recommend exporting the active workflows (or using the n8n MCP tools, if connected) for a full pass. If genuinely nothing n8n-related is found, skip silently.
+
+**Node JSON is typically emitted as one long line per node** — a node's entire `parameters` object, `type`, `name`, and `credentials` block are usually on the same line in an export. This matters for how to read grep results: a single matching line IS the whole node, so checking "does this node also have field X" means reading the rest of that same matched line, not a nearby one.
+
+### 5.1 — Webhook (and Form Trigger) nodes with no authentication
+
+```
+Grep: "type":\s*"n8n-nodes-base\.(webhook|formTrigger)"
+```
+For each match, read the full line for an `"authentication"` field. No `authentication` key at all, or `"authentication":"none"`, means the webhook is publicly callable by anyone with the URL — no exception. **This is not automatically a bug** — a public lead-capture form or a payment-provider webhook (which authenticates via its own signature instead, see 5.4) is supposed to be open. Judge it the same way as Phase 4.4: trace what the webhook triggers downstream, and flag it only when the consequence is sensitive.
+
+### 5.2 — Hardcoded credentials instead of n8n's credential system
+
+```
+Grep: "type":\s*"n8n-nodes-base\.httpRequest"
+```
+A properly-configured HTTP Request node uses `"authentication":"genericCredentialType"` (or a named credential type) plus a `"credentials":{...}` block referencing a stored credential ID — the actual secret never appears in the workflow JSON. Flag as **CRITICAL** any HTTP Request (or similar) node where a value inside `headerParameters`, `qs`, `jsonBody`, or `url` matches one of the Phase 2 secret patterns directly (`Bearer sk_...`, `Authorization: ...`, API keys in a query string) instead of coming from a credential reference — that secret is now sitting in plaintext in every export, backup, and version-history snapshot of the workflow.
+
+### 5.3 — Code / Execute Command nodes running unsanitized input
+
+```
+Grep: "type":\s*"n8n-nodes-base\.code"          # then check the jsCode/pythonCode value for eval(, Function(, exec(
+Grep: "type":\s*"n8n-nodes-base\.executeCommand"   # then check whether "command" is built from an n8n expression (starts with ={{ ) that references upstream/webhook data ($json, $input)
+```
+A Code node calling `eval()`/`Function()` on data that ultimately originated from a Webhook node's payload is script injection inside your own automation platform. An Execute Command node whose command string is built from `{{ $json... }}` sourced from external input is command injection against the n8n host itself — often with the same OS-level access as the rest of the n8n instance (other workflows' credentials, the encryption key, the database connection). Flag as **CRITICAL**. Trace the data back to its source node before flagging — a Code node processing only internally-generated data (e.g. a value set by an earlier Set node from a fixed list) is not exploitable the same way.
+
+### 5.4 — Unauthenticated webhook driving a costed or reputation-sensitive action (validated against a real workflow while writing this phase)
+
+This is the single most common real finding in this phase, and it doesn't require a code-level bug — the webhook, the credential handling, and the individual nodes can all be configured exactly "correctly" and the workflow is still abusable. The pattern: a public Webhook node (5.1, no auth — correctly so, since it's a public form) feeds a chain that ends in an action with a cost or a blast radius beyond the submitter themselves — most commonly an outbound email/SMS send where the recipient address comes from the request body, not from the authenticated submitter's own identity (because there IS no authenticated submitter). Concretely: `{ "correo": "victim@example.com", ... }` posted to the form's webhook, repeated automatically, turns a legitimate transactional-email workflow into an email-bombing tool against any third party the attacker chooses, and/or a "wallet attack" running up the email provider's sending costs and burning the sending domain's reputation.
+```
+Grep: "type":\s*"n8n-nodes-base\.webhook"         # find the public entry point (5.1)
+```
+Trace its downstream connections (the workflow's `connections` object) for any node whose `type` sends email/SMS/push (HTTP Request to a provider like Resend/SendGrid/Twilio, or a dedicated node for one of those services) where the destination address/number is read from the webhook payload. Flag as **HIGH** if there's no per-submitter rate limiting (check for a preceding node that deduplicates/throttles by IP or by the target address — e.g. a lookup against a "recently sent" table before proceeding) and no verification that the target actually requested the message (e.g. a double opt-in / confirmation step). A honeypot field (common anti-bot pattern) filters obvious bots but does **not** stop a targeted human attacker who simply leaves it empty — don't treat a honeypot's presence as sufficient mitigation for this specific finding.
+
+### 5.5 — Instance-level configuration (only checkable when deployment config is in the repo)
+
+```
+Grep: N8N_ENCRYPTION_KEY
+Grep: N8N_BASIC_AUTH_ACTIVE|N8N_USER_MANAGEMENT_DISABLED
+Grep: N8N_SECURE_COOKIE
+```
+- `N8N_ENCRYPTION_KEY` hardcoded/committed anywhere is **CRITICAL** — it's the key that decrypts every stored credential in that n8n instance's database (every API key, every OAuth token, every webhook secret the instance has ever stored). Treat it with the same severity as a database root password.
+- `N8N_USER_MANAGEMENT_DISABLED=true` (or the older `N8N_BASIC_AUTH_ACTIVE` missing/false) on an internet-reachable n8n instance means the editor UI and its `/rest/` management API are reachable with no login at all — anyone who finds the URL can read, edit, and execute every workflow and read every stored credential's metadata. Flag as **CRITICAL** if the instance appears to be internet-facing (no VPN/IP-allowlist signal in the same compose/config file).
+- `N8N_SECURE_COOKIE=false` on an instance served over HTTPS unnecessarily weakens session cookie protection — **LOW**, but flag it since it's a one-line fix.
+
+---
+
+## PHASE 6 — SAAS, MARKETPLACE & MONETIZATION SECURITY (freemium, subscriptions, in-app purchases, creator marketplaces)
 
 **Trigger this phase when ANY of:** the project has a pricing/plan model (free vs. paid tiers), a marketplace where users sell to other users (asset stores, game/creator marketplaces), subscriptions, or any payment integration (Stripe, MercadoPago, PayPal, in-app purchase).
 ```
@@ -861,7 +916,7 @@ Every query for a resource scoped to a tenant/organization/creator must filter b
 
 ---
 
-## PHASE 6 — ADVANCED & RARE ATTACK VECTORS
+## PHASE 7 — ADVANCED & RARE ATTACK VECTORS
 
 These are lower-frequency but well-documented, real vulnerability classes that don't fit cleanly into the OWASP Top 10 buckets above. Check for them on every audit regardless of stack; skip silently (no need to report "not applicable") when a pattern genuinely can't apply (e.g. GraphQL checks on a project with no GraphQL layer).
 
@@ -947,14 +1002,90 @@ An unvalidated `redirect_uri`/`return_to`/`next` parameter, especially in an OAu
 ### 6.11 — GraphQL-specific (only if a GraphQL layer is detected)
 
 ```
-Grep in deps: "graphql", "apollo-server", "graphql-yoga"
+Grep in deps: "graphql", "apollo-server", "graphql-yoga", "@apollo/server"
 Grep: introspection:\s*true                              # introspection left on in production
+Grep: depthLimit|queryComplexity|costAnalysis             # presence = good, absence = check further
+Grep: resolve:\s*\(|resolve\s*\(                          # enumerate every resolver — read each one, don't rely on a regex for the auth check itself
 ```
-Check for: introspection enabled in production (exposes the entire schema, including unused/admin-only fields, to anyone), missing query depth/complexity limiting (a deeply nested query can cause exponential resolver calls — a DoS vector unique to GraphQL), and batching endpoints with no per-batch rate limiting (turns a rate limit on 1 request into unlimited effective requests per HTTP call).
+For every resolver found, read its body for a permission check — GraphQL's single-endpoint-many-fields shape means **REST-style route-level auth checks don't exist here**; every resolver that returns sensitive data needs its own check, and it's common for a schema to correctly protect its Query root fields while a nested field resolver (e.g. `User.privateNotes`) has none, because it's reachable through a different, less obviously-sensitive parent query. This is a manual-read step, the same way Phase 5.1's paywall check is — the presence/absence of an auth check inside a function body isn't reliably expressible as a single grep pattern.
+
+Check for:
+- **Introspection enabled in production** — exposes the entire schema, including unused/admin-only fields, to anyone. Should be disabled outside development.
+- **Field-level authorization gaps** — a query can be allowed while a nested field it returns isn't supposed to be visible to the caller; check resolvers for fields containing PII/internal data specifically, not just the top-level query.
+- **Missing query depth/complexity limiting** — a deeply nested or circular query can cause exponential resolver calls, a DoS vector essentially unique to GraphQL's shape.
+- **Batching with no per-batch rate limiting** — a batched request turns a rate limit designed for "1 request" into unlimited effective operations per HTTP call.
+- **Verbose errors** — default Apollo/GraphQL error formatting can leak resolver stack traces and internal field names to the client; check for a custom `formatError` that strips internals in production.
+- **State-changing mutations over GET with cookie auth** — if the GraphQL endpoint accepts queries via `GET` (some setups do, for caching) and auth relies on cookies, mutations become CSRF-exploitable the same way as Phase 6.5 — mutations should only be reachable via `POST`.
 
 ---
 
-## PHASE 7 — CWE TOP 25 (by language)
+## PHASE 8 — CLOUD INFRASTRUCTURE & IaC SECURITY (Terraform, CloudFormation, Kubernetes, cloud IAM)
+
+**Trigger this phase when ANY of:**
+```
+Glob: **/*.tf, **/*.tfvars, **/terraform.tfstate
+Glob: **/*.yaml, **/*.yml — check for `kind: Deployment|Pod|Service|Role|ClusterRole` (Kubernetes manifests)
+Glob: **/cloudformation*.yaml, **/cloudformation*.json, **/template.yaml (SAM)
+Glob: **/*.tf.json, **/pulumi/**, **/cdk.out/**
+```
+This phase is distinct from Phase 11 (Infrastructure & Config Review) — that one covers app-level Docker/CI-CD hygiene; this one covers cloud provider permission models and orchestration configs, a different failure class (identity and access management, not application config).
+
+### 8.1 — Terraform state file exposure
+
+```
+Glob: **/terraform.tfstate, **/*.tfstate
+```
+A `.tfstate` file contains **plaintext values of every resource it manages, including secrets** — database passwords, generated API keys, private keys — even for resources whose Terraform definition marks the input variable `sensitive = true` (that flag only redacts CLI output, not the state file itself). A `.tfstate` file committed to git, or stored in an S3 backend bucket without encryption and strict access policy, is **CRITICAL**. Fix: remote state backend (S3+DynamoDB lock, Terraform Cloud) with encryption at rest and IAM-restricted access; never commit state; if one was ever committed, treat every secret in it as compromised and rotate.
+
+### 8.2 — Overly broad IAM policies
+
+```
+Grep: "Action":\s*"\*"                                    # AWS IAM wildcard action
+Grep: "Resource":\s*"\*"                                  # AWS IAM wildcard resource
+Grep: roles/owner|roles/editor                            # GCP primitive roles (should use granular predefined/custom roles)
+Grep: AssumeRolePolicyDocument.*"Principal":\s*"\*"        # any AWS account can assume this role
+```
+A policy combining `"Action": "*"` with `"Resource": "*"` grants full administrative access to whatever it's attached to — flag as **CRITICAL** on any role/user attached to an application workload (a Lambda's execution role, an EC2 instance profile, a CI/CD deploy user) rather than a genuinely break-glass human admin role. Recommend scoping to the specific actions and ARNs the workload actually needs.
+
+### 8.3 — Public storage bucket / object storage misconfiguration
+
+```
+Grep: "BlockPublicAcls":\s*false|"BlockPublicPolicy":\s*false     # AWS API/CloudFormation JSON style
+Grep: block_public_acls\s*=\s*false|block_public_policy\s*=\s*false|restrict_public_buckets\s*=\s*false   # Terraform HCL style (aws_s3_bucket_public_access_block) — the more common real-world shape, verified against a synthetic Terraform snippet where the JSON-style pattern alone matched nothing
+Grep: acl\s*=\s*"public-read"|acl\s*=\s*"public-read-write"        # Terraform S3 bucket ACL
+Grep: allUsers|allAuthenticatedUsers                                # GCP bucket IAM binding to anyone
+```
+Same reasoning as Phase 4.6 (Supabase storage) — a bucket is only a finding if what it stores is sensitive. Cross-reference against what the application actually writes there before assigning severity; a bucket serving public static assets is fine, one holding backups, user uploads, or Terraform state (8.1) is **CRITICAL**.
+
+### 8.4 — Kubernetes: privileged/root containers and missing isolation
+
+```
+Grep: privileged:\s*true
+Grep: runAsUser:\s*0
+Grep: hostNetwork:\s*true|hostPID:\s*true|hostIPC:\s*true
+Grep: allowPrivilegeEscalation:\s*true
+```
+A container running `privileged: true` or as `runAsUser: 0` (root) with no explicit `securityContext` restricting capabilities can, if compromised via any application-layer vulnerability inside it, escalate to control the underlying node — a much larger blast radius than the container itself. `hostNetwork`/`hostPID`/`hostIPC: true` similarly break the isolation Kubernetes is supposed to provide between workloads on the same node. Flag as **HIGH**, **CRITICAL** if the container also handles untrusted input (a public-facing API, a webhook receiver, a sandboxed code-execution service).
+
+### 8.5 — Kubernetes: secrets as plain environment variables, missing NetworkPolicy
+
+```
+Grep: kind:\s*Deployment — check nearby env: for value: (rather than valueFrom: secretKeyRef:)
+Grep: kind:\s*NetworkPolicy                                # presence check — absence across the whole manifest set is the finding
+```
+Secrets injected via a literal `value:` in a Deployment/Pod spec (instead of `valueFrom: secretKeyRef:` pointing at a Kubernetes `Secret` object) end up readable by anyone with `kubectl describe pod`/`get pod -o yaml` access, and are stored in etcd with the same exposure either way — but the literal form also leaks into version control and CI logs where the spec is defined. Flag as **MEDIUM**. Separately, a cluster with zero `NetworkPolicy` resources defined means every pod can reach every other pod by default ("flat network") — a compromised low-value service (e.g. a public frontend) can then directly reach a database or internal admin service with no network-layer barrier. Flag as **MEDIUM**–**HIGH** depending on what's reachable.
+
+### 8.6 — CI/CD deploy credentials with standing cloud access
+
+```
+Grep in .github/workflows, .gitlab-ci.yml: AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY   # long-lived static keys in CI
+Grep: aws-actions/configure-aws-credentials                                            # check if it uses OIDC (role-to-assume) vs static keys
+```
+Long-lived AWS/GCP/Azure static credentials stored as CI secrets are a standing target — if the CI provider or the pipeline config is ever compromised, they're valid indefinitely until manually rotated. Recommend OIDC-based short-lived credentials (`aws-actions/configure-aws-credentials` with `role-to-assume`, no `aws-access-key-id`) instead. Flag static long-lived cloud credentials in CI as **MEDIUM**, or **HIGH** if the role/user they authenticate as has the broad-policy pattern from 8.2.
+
+---
+
+## PHASE 9 — CWE TOP 25 (by language)
 
 ### JavaScript / TypeScript
 - **CWE-79** (XSS): `dangerouslySetInnerHTML`, `innerHTML =`, `document.write`, unescaped template literals in HTML
@@ -1009,7 +1140,7 @@ eval\s*\(\$_                      # PHP eval injection
 
 ---
 
-## PHASE 8 — SECURITY HEADERS
+## PHASE 10 — SECURITY HEADERS
 
 Check the project's HTTP header configuration. Look in:
 - `next.config.js` / `next.config.ts` / `next.config.mjs`
@@ -1092,7 +1223,7 @@ async def add_security_headers(request, call_next):
 
 ---
 
-## PHASE 9 — INFRASTRUCTURE & CONFIG REVIEW
+## PHASE 11 — INFRASTRUCTURE & CONFIG REVIEW
 
 ### .env file exposure
 ```
@@ -1141,7 +1272,7 @@ on:\s*pull_request_target                # Dangerous event — can access secret
 
 ---
 
-## PHASE 10 — LATAM-SPECIFIC CHECKS
+## PHASE 12 — LATAM-SPECIFIC CHECKS
 
 ### MercadoPago
 ```
@@ -1186,7 +1317,7 @@ function validateMPWebhook(req: Request): boolean {
 
 ---
 
-## PHASE 11 — DEPENDENCY AUDIT
+## PHASE 13 — DEPENDENCY AUDIT
 
 Run the appropriate command based on detected stack:
 
@@ -1231,7 +1362,7 @@ composer audit 2>/dev/null
 
 ---
 
-## PHASE 12 — SCORING ENGINE
+## PHASE 14 — SCORING ENGINE
 
 Calculate score starting from 100. Apply deductions:
 
@@ -1243,10 +1374,18 @@ CRITICAL findings:
   - Privilege escalation via DB function/RPC grant:  -25 each (max -50)   [Phase 4.5]
   - RLS/security-rule exposes data across roles      -20 each (max -40)   [Phase 4.4 / 4.8]
     or tenants (multi-tenant isolation failure)
-  - Client-side-only paywall / entitlement bypass:   -20 each (max -40)   [Phase 5.1]
+  - Client-side-only paywall / entitlement bypass:   -20 each (max -40)   [Phase 6.1]
   - Insecure deserialization:                        -15 each (max -30)
   - CRITICAL CVE in dependency:                      -15 each (max -30)
-  - JWT algorithm confusion (no alg allowlist):      -20 each (max -40)   [Phase 6.1]
+  - JWT algorithm confusion (no alg allowlist):      -20 each (max -40)   [Phase 7.1]
+  - N8N_ENCRYPTION_KEY committed/hardcoded:          -25 each (max -50)   [Phase 5.5]
+  - n8n instance with no auth (internet-facing):     -20 each (max -40)   [Phase 5.5]
+  - Command/code injection via n8n Code/Execute      -20 each (max -40)   [Phase 5.3]
+    Command node fed by external input:
+  - Terraform state file (.tfstate) committed        -20 each (max -40)   [Phase 8.1]
+    to git (plaintext secrets):
+  - IAM policy: Action:* + Resource:* on a           -20 each (max -40)   [Phase 8.2]
+    workload identity (not a human admin role):
 
 HIGH findings:
   - Hardcoded credentials (non-production):          -10 each (max -20)
@@ -1258,15 +1397,24 @@ HIGH findings:
   - SECURITY DEFINER function missing SET            -8 each (max -16)   [Phase 4.5]
     search_path (hijacking risk):
   - Public storage bucket with private user files:   -12 each (max -24)   [Phase 4.6]
-  - Payment webhook: no signature check or           -12 each (max -24)   [Phase 5.3]
+  - Payment webhook: no signature check or           -12 each (max -24)   [Phase 6.3]
     no replay/idempotency protection:
-  - Unprotected digital asset URL (paywall bypass    -10 each (max -20)   [Phase 5.7]
+  - Unprotected digital asset URL (paywall bypass    -10 each (max -20)   [Phase 6.7]
     via direct link):
-  - Price/amount trusted from client at checkout:    -12 each (max -24)   [Phase 5.2]
-  - Session fixation (no regenerate on login):       -8 each (max -16)    [Phase 6.4]
-  - CSRF-exploitable state change on GET:            -8 each (max -16)    [Phase 6.5]
-  - Prototype pollution via unguarded deep merge:    -10 each (max -20)   [Phase 6.7]
-  - Open redirect (OAuth/return_to):                 -8 each (max -16)    [Phase 6.10]
+  - Price/amount trusted from client at checkout:    -12 each (max -24)   [Phase 6.2]
+  - Session fixation (no regenerate on login):       -8 each (max -16)    [Phase 7.4]
+  - CSRF-exploitable state change on GET:            -8 each (max -16)    [Phase 7.5]
+  - Prototype pollution via unguarded deep merge:    -10 each (max -20)   [Phase 7.7]
+  - Open redirect (OAuth/return_to):                 -8 each (max -16)    [Phase 7.10]
+  - Inline secret in n8n workflow JSON instead of    -10 each (max -20)   [Phase 5.2]
+    the credential system:
+  - Unauthenticated webhook driving costed/          -8 each (max -16)    [Phase 5.4]
+    reputation-sensitive action (no rate limit):
+  - Public cloud storage bucket with sensitive        -12 each (max -24)   [Phase 8.3]
+    data (backups, uploads, state files):
+  - Privileged/root Kubernetes container handling    -10 each (max -20)   [Phase 8.4]
+    untrusted input:
+  - Long-lived static cloud credentials in CI/CD:    -8 each (max -16)    [Phase 8.6]
 
 MEDIUM findings:
   - Weak cryptography (MD5/SHA1 for passwords):      -5 each (max -10)
@@ -1274,18 +1422,21 @@ MEDIUM findings:
   - CORS misconfiguration:                           -5 each (max -10)
   - Debug mode in production signals:                -5 (flat)
   - MODERATE CVE in dependency:                      -3 each (max -9)
-  - Excessive data exposure (SELECT * to client):    -5 each (max -10)    [Phase 6.3]
-  - Free-trial/free-tier abuse (no durable check):   -5 each (max -10)    [Phase 5.5]
-  - Timing/message-based user enumeration:           -4 each (max -8)     [Phase 6.6]
-  - ReDoS-prone regex on public endpoint:            -5 each (max -10)    [Phase 6.8]
+  - Excessive data exposure (SELECT * to client):    -5 each (max -10)    [Phase 7.3]
+  - Free-trial/free-tier abuse (no durable check):   -5 each (max -10)    [Phase 6.5]
+  - Timing/message-based user enumeration:           -4 each (max -8)     [Phase 7.6]
+  - ReDoS-prone regex on public endpoint:            -5 each (max -10)    [Phase 7.8]
   - Broad USING(true)/anon-readable policy on        -5 each (max -10)    [Phase 4.4]
     non-sensitive catalog data (informational risk):
+  - Kubernetes secret as plain env value, or         -5 each (max -10)    [Phase 8.5]
+    cluster with no NetworkPolicy at all:
 
 LOW findings:
   - Single missing security header:                  -2 each (max -8)
   - Non-sensitive info in logs:                      -2 each (max -4)
   - Minor misconfigurations:                         -2 each (max -4)
-  - Sequential/enumerable public resource IDs:       -2 each (max -6)     [Phase 6.2]
+  - Sequential/enumerable public resource IDs:       -2 each (max -6)     [Phase 7.2]
+  - N8N_SECURE_COOKIE=false on HTTPS-served instance: -2 each (max -4)    [Phase 5.5]
 
 Minimum score: 0
 ```
@@ -1301,7 +1452,7 @@ Minimum score: 0
 
 ---
 
-## PHASE 13 — REPORT OUTPUT
+## PHASE 15 — REPORT OUTPUT
 
 Generate the report in this exact format:
 
@@ -1366,7 +1517,7 @@ RESUMEN
 
 ━━━━ CHECKLIST PRE-DEPLOY ━━━━━━━━━━━━━━━━━━━━━━━
 
-<stack-specific checklist — see Phase 14>
+<stack-specific checklist — see Phase 16>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   auditron | Luis Recalde | MIT 2026
@@ -1378,7 +1529,7 @@ If no findings at all in a category, write: `Sin hallazgos en esta categoría.`
 
 ---
 
-## PHASE 14 — PRE-DEPLOY CHECKLISTS
+## PHASE 16 — PRE-DEPLOY CHECKLISTS
 
 ### NEXTJS
 ```
@@ -1518,6 +1669,30 @@ PRE-DEPLOY CHECKLIST — Monetización
 [ ] Si es multi-tenant: el tenant/organización se deriva de la sesión autenticada, nunca de un parámetro de la URL/body
 ```
 
+### N8N / AUTOMATIZACIÓN DE WORKFLOWS
+```
+PRE-DEPLOY CHECKLIST — n8n
+[ ] Nodos Webhook con authentication: none — revisados uno por uno, cada uno justificado (formulario público, webhook de proveedor con firma propia)
+[ ] Ningún Webhook público sin auth dispara envío de email/SMS a una dirección/número tomado del body sin límite de tasa por remitente
+[ ] Nodos HTTP Request: credenciales via el sistema de Credentials de n8n, ninguna API key/token pegada directo en headers/URL/body
+[ ] Nodos Code/Execute Command: sin eval()/Function()/exec() sobre datos que vienen de un Webhook u otra fuente externa
+[ ] N8N_ENCRYPTION_KEY: no committeada en ningún repo, generada una vez y resguardada (perderla o rotarla rompe todas las credenciales guardadas)
+[ ] Instancia de n8n expuesta a internet: user management/basic auth activado, no accesible sin login
+[ ] N8N_SECURE_COOKIE en true si la instancia se sirve por HTTPS (siempre en producción)
+```
+
+### CLOUD / INFRAESTRUCTURA COMO CÓDIGO (Terraform, Kubernetes, CI/CD)
+```
+PRE-DEPLOY CHECKLIST — Cloud/IaC
+[ ] terraform.tfstate: nunca commiteado, backend remoto con cifrado y acceso restringido por IAM
+[ ] Políticas IAM de identidades de aplicación (no humanos): sin combinación Action:* + Resource:*
+[ ] Buckets S3/GCS: Block Public Access activado salvo excepción justificada y documentada
+[ ] Contenedores Kubernetes: sin privileged:true ni runAsUser:0 salvo necesidad real justificada
+[ ] Secrets de Kubernetes: via Secret + secretKeyRef, nunca como value: literal en el manifest
+[ ] Al menos una NetworkPolicy definida — el cluster no queda en red plana por default
+[ ] Credenciales cloud en CI/CD: OIDC de corta duración en vez de access keys estáticas donde el proveedor lo soporte
+```
+
 ---
 
 ## EXECUTION NOTES
@@ -1532,7 +1707,7 @@ PRE-DEPLOY CHECKLIST — Monetización
 8. **Language** — write the report in the same language the user used to invoke the skill (Spanish or English).
 9. **No hallazgos = good news** — if a section is clean, say so clearly: "Sin hallazgos. ✓"
 10. **Rotate first** — when reporting exposed secrets, always lead with "Rotar la credencial INMEDIATAMENTE" before any code fixes.
-11. **Never skip Phase 4/5 checks based on Phase 1 alone** — a BaaS backend or a monetization layer can sit behind any frontend stack. Actually run the trigger checks in Phase 4 and Phase 5 for every project; only write "fase omitida" after confirming none of the trigger signals matched, not by assumption.
+11. **Never skip Phase 4/5/6/8 checks based on Phase 1 alone** — a BaaS backend, an n8n automation layer, a monetization layer, or cloud/IaC config can sit behind or alongside any frontend stack, or exist with no frontend at all. Actually run the trigger checks in each of those phases for every project; only write "fase omitida" after confirming none of the trigger signals matched, not by assumption.
 12. **Code review ≠ privilege review** — findings in Phase 4 (database privileges, RLS, GRANTs) cannot be fully confirmed by reading `schema.sql` alone if that file might be stale. Say so explicitly in the report when a live `supabase db dump --linked` wasn't possible, so the user knows the finding's confidence level.
 13. **Ask before testing live** — the live RLS-simulation technique in Phase 4.5 touches a real database (even if only `SELECT`/read-only `SET ROLE` simulation). Always get explicit user confirmation before running it against a production or otherwise live project, and always clean up any disposable test accounts created for the test before closing the audit.
 14. **Business logic over pattern-matching in Phase 5** — monetization/entitlement bugs rarely match a clean regex the way a hardcoded secret does. Read the actual request/response flow for checkout, webhook, and paywall-gated endpoints; a missing grep hit is not the same as "no finding" for this phase.

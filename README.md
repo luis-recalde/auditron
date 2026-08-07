@@ -39,7 +39,7 @@ Auditron detecta el tipo de proyecto y adapta la auditoría:
 | PHP genérico | `*.php`, `composer.json` | composer audit, injection |
 | Sitio estático | Solo HTML/CSS/JS | secrets en frontend, headers |
 
-Esta detección es solo del framework de frontend. Si el proyecto además usa Supabase, Firebase, o tiene pagos/suscripciones, Auditron corre esas auditorías **además**, sin importar qué stack haya detectado — un proyecto React con Supabase recibe el análisis de React completo *y* la auditoría de privilegios de base de datos.
+Esta detección es solo del framework de frontend. Si el proyecto además usa Supabase/Firebase, n8n, tiene pagos/suscripciones, o incluye Terraform/Kubernetes, Auditron corre esas auditorías **además**, sin importar qué stack haya detectado — un proyecto React con Supabase recibe el análisis de React completo *y* la auditoría de privilegios de base de datos, y un repo de solo infraestructura (sin frontend) igual recibe la auditoría de Cloud/IaC.
 
 ### Cobertura de seguridad
 
@@ -101,6 +101,12 @@ Esta detección es solo del framework de frontend. Si el proyecto además usa Su
 - Reglas de seguridad de Firestore/Firebase Storage equivalentes a `USING(true)`
 - Técnica de verificación en vivo (opcional, con permiso explícito): simula sesiones de bajo privilegio contra la base real para confirmar que un hallazgo cerrado realmente quedó cerrado
 
+**Automatización de workflows — n8n (y exports de Zapier/Make):**
+- Nodos Webhook sin autenticación que disparan acciones costosas o sensibles (email/SMS a una dirección tomada del body, sin límite de tasa) — validado contra un workflow real de producción
+- Credenciales pegadas directo en un nodo HTTP Request en vez de usar el sistema de Credentials de n8n (quedan en texto plano en cada export/backup)
+- Nodos Code/Execute Command ejecutando `eval()` o comandos de shell sobre datos que vienen de un Webhook externo
+- `N8N_ENCRYPTION_KEY` expuesta (descifra todas las credenciales guardadas en la instancia) e instancia sin autenticación de usuario expuesta a internet
+
 **SaaS, marketplaces y monetización (freemium, suscripciones, venta entre usuarios):**
 - Paywalls/features pagas verificadas solo en el frontend (bypasseables llamando la API directo)
 - Monto o plan de checkout confiado desde el cliente en vez de calculado en el servidor
@@ -118,7 +124,15 @@ Esta detección es solo del framework de frontend. Si el proyecto además usa Su
 - Fijación de sesión, CSRF en peticiones GET que mutan estado
 - Enumeración de usuarios por mensajes/tiempos de respuesta distintos
 - Prototype pollution, ReDoS, dependency confusion, open redirect en flujos OAuth
-- GraphQL: introspección en producción, falta de límite de profundidad/complejidad
+- GraphQL: introspección en producción, autorización a nivel de campo/resolver, falta de límite de profundidad/complejidad, errores verbosos, mutaciones vía GET con auth por cookie
+
+**Cloud e infraestructura como código (Terraform, Kubernetes, CI/CD):**
+- Archivo `terraform.tfstate` commiteado (contiene secretos en texto plano aunque la variable tenga `sensitive = true`)
+- Políticas IAM con `Action: *` + `Resource: *` en identidades de aplicación, no solo humanos
+- Buckets S3/GCS públicos con backups o archivos de usuario
+- Contenedores Kubernetes `privileged: true` o corriendo como root, cluster sin ninguna `NetworkPolicy`
+- Secrets de Kubernetes como variable de entorno literal en vez de `secretKeyRef`
+- Credenciales cloud estáticas de larga duración en CI/CD en vez de OIDC de corta duración
 
 ### Headers de seguridad
 Revisa y genera configuración para:
