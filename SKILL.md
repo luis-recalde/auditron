@@ -825,7 +825,7 @@ Glob: **/webhooks/**, **/api/stripe/**, **/api/checkout/**
 
 The vulnerabilities in this phase are almost never "missing auth" — they're **business logic trusting the client**. A user who is authenticated as themselves (no privilege escalation needed) manipulates a request to get something they didn't pay for. These are consistently under-tested because they require thinking like a paying customer trying to avoid paying, not like an attacker looking for a broken auth check.
 
-### 5.1 — Client-side-only entitlement / paywall bypass (the #1 real-world finding in this category)
+### 6.1 — Client-side-only entitlement / paywall bypass (the #1 real-world finding in this category)
 
 This one doesn't reduce to a single reliable regex — the vulnerable shape varies too much (an `if`, a ternary, a `disabled` prop, a route guard) for a pattern to catch consistently, and testing against realistic snippets while writing this phase confirmed an over-specific regex here just returns zero matches on real code shaped slightly differently. Use these as **candidate anchors** to find where to look, not as the check itself:
 ```
@@ -852,7 +852,7 @@ export async function POST(req: Request) {
 }
 ```
 
-### 5.2 — Price / amount / plan tampering at checkout
+### 6.2 — Price / amount / plan tampering at checkout
 
 ```
 Grep: amount\s*[:=]\s*req\.(body|query)|price\s*[:=]\s*req\.(body|query)
@@ -860,7 +860,7 @@ Grep: stripe\.checkout\.sessions\.create\(\{[^}]*amount\s*:\s*(body|req)
 ```
 If the checkout/order-creation endpoint accepts `amount`, `price`, or `plan_id` from the client and uses it directly to create the charge, a user can pay $0.01 for anything. The backend must look up the price from its own price table/Stripe Price ID, keyed only by a product/plan identifier — never trust a client-sent amount.
 
-### 5.3 — Payment webhook integrity (signature + replay)
+### 6.3 — Payment webhook integrity (signature + replay)
 
 Beyond just "is the signature checked" (already covered in Phase 9 for MercadoPago) — two more common gaps:
 ```
@@ -870,18 +870,18 @@ Grep: (webhook|event)\.id.*(processed|seen|idempotenc)  # idempotency/replay che
 - **No idempotency check** on payment-confirmed webhooks → an attacker (or a retried delivery from the provider itself, which is normal and expected) that replays the same event can double-credit an account, double-grant a purchased item, or double-extend a subscription. Flag as **HIGH** if there's no check that the event ID was already processed before granting the entitlement.
 - **Webhook handler grants access before verifying the signature**, or verifies it but doesn't `return`/`throw` on failure (verifies-then-ignores-the-result is a real, recurring bug). Flag as **CRITICAL**.
 
-### 5.4 — Subscription/entitlement race on cancel-and-reuse
+### 6.4 — Subscription/entitlement race on cancel-and-reuse
 
 Check whether canceling a subscription immediately revokes access or only revokes it at `current_period_end`. Neither is wrong on its own, but the code must be internally consistent — if cancellation immediately flips `isPro = false` while Stripe still considers the period active (or vice versa), users can exploit the gap. Also check for a downgrade path that doesn't clear out usage tied to the higher tier (e.g. a free-tier user who was briefly Pro keeps Pro-tier resource limits forever because the limit was cached at creation time, not re-checked).
 
-### 5.5 — Free-trial / free-tier abuse (no durable identity check)
+### 6.5 — Free-trial / free-tier abuse (no durable identity check)
 
 ```
 Grep: (?i)trial|free_tier|freeTier|first_?time_?user
 ```
 If trial eligibility is checked only against the current account/email, a user can create unlimited accounts (disposable emails, `+1`/`+2` Gmail aliases) to get unlimited free trials or repeatedly claim a one-per-user free credit grant. This is rarely "critical" but is a real, common revenue-leak finding — flag as **MEDIUM** and note it as a business-risk item, not just a security one.
 
-### 5.6 — Marketplace-specific: creator payout & commission tampering
+### 6.6 — Marketplace-specific: creator payout & commission tampering
 
 Applies directly to any project where users sell to other users (asset marketplaces, game/creator stores, plugin marketplaces):
 ```
@@ -889,7 +889,7 @@ Grep: commission|payout|seller_amount|creator_share
 ```
 If the commission percentage or the seller's payout amount is computed anywhere in client-controllable input (rather than derived server-side from a fixed rate at the time of sale), a seller can manipulate their own payout upward. Also check that a buyer cannot mark their own transaction as refunded/completed without going through the actual payment provider's confirmation.
 
-### 5.7 — Digital asset / paid-content protection (DRM-adjacent)
+### 6.7 — Digital asset / paid-content protection (DRM-adjacent)
 
 ```
 Grep: signedUrl|getSignedUrl|expiresIn
@@ -897,7 +897,7 @@ Grep: <a\s+href=.*\/(assets|downloads|exports)\/.*\.(zip|pdf|unitypackage|glb)
 ```
 If paid digital assets (game asset packs, exported files, premium templates) are served via a permanent, unauthenticated, or long-lived public URL rather than a short-lived signed URL re-issued after an entitlement check, the URL can be shared/leaked to bypass payment entirely, and search engines or link-sharing can expose it publicly. Flag as **HIGH**. Recommend signed URLs with short expiry (minutes, not days) re-generated per authorized request.
 
-### 5.8 — Usage-based abuse / "wallet attack" on metered AI or compute features
+### 6.8 — Usage-based abuse / "wallet attack" on metered AI or compute features
 
 Applies to any feature that calls a paid third-party API (AI generation, image/video rendering, SMS, email) per user action:
 ```
@@ -905,7 +905,7 @@ Grep: openai\.|anthropic\.|generateImage|generateVideo — check for per-user ra
 ```
 If a free-tier (or even paid-tier) user can trigger unlimited calls to an expensive backend operation with no per-user/per-IP rate limit or daily quota enforced server-side, an attacker can run up the project owner's third-party bill arbitrarily ("wallet attack" / denial of wallet) even without breaking any data confidentiality. Flag as **HIGH** if a metered/costed operation has no server-side quota check independent of the frontend UI's own throttling.
 
-### 5.9 — Multi-tenant / multi-creator data isolation
+### 6.9 — Multi-tenant / multi-creator data isolation
 
 ```
 Grep: WHERE.*=\s*req\.(params|body|query)\.(tenant|org|account|creator)Id   # raw SQL — tenant id taken from request instead of session
@@ -920,7 +920,7 @@ Every query for a resource scoped to a tenant/organization/creator must filter b
 
 These are lower-frequency but well-documented, real vulnerability classes that don't fit cleanly into the OWASP Top 10 buckets above. Check for them on every audit regardless of stack; skip silently (no need to report "not applicable") when a pattern genuinely can't apply (e.g. GraphQL checks on a project with no GraphQL layer).
 
-### 6.1 — JWT algorithm confusion
+### 7.1 — JWT algorithm confusion
 
 **Ripgrep doesn't support lookaround** (`(?!...)`) — don't write a pattern that depends on it, it will silently match nothing and look like a clean bill of health. Grep for the anchor, then read each result to judge the negative condition:
 ```
@@ -929,7 +929,7 @@ Grep: jwt\.verify\(.*algorithms\s*:\s*\[.*(RS256.*HS256|HS256.*RS256)
 ```
 If `jwt.verify()` is called without an explicit `algorithms: [...]` allowlist, or with both `RS256` and `HS256` accepted, an attacker who knows the RS256 public key (often published, e.g. at a `/.well-known/jwks.json` endpoint or embedded in the frontend) can forge a token signed with HS256 using the public key as the HMAC secret — the library will accept it as valid. **CRITICAL.** Fix: always pass an explicit single-algorithm allowlist matching what the issuer actually uses.
 
-### 6.2 — IDOR via enumerable identifiers
+### 7.2 — IDOR via enumerable identifiers
 
 ```
 Grep: id\s+(SERIAL|INTEGER|BIGINT)\s+PRIMARY KEY      # auto-increment PK — check if that table's id is ever used in a public URL/route
@@ -937,7 +937,7 @@ Grep: /:(id|invoiceId|orderId|userId)\b               # route params — cross-r
 ```
 Beyond "is there an ownership check" (Phase 3, A01) — even WITH an ownership check, using sequential integer IDs as public-facing identifiers (`/invoice/1042`, `/order/883`) lets an attacker infer the existence and approximate volume of other users' records, and turns any future ownership-check regression into full enumeration. Recommend UUIDs (or ULIDs if ordering matters) for any publicly-referenced resource ID.
 
-### 6.3 — Excessive data exposure in API responses
+### 7.3 — Excessive data exposure in API responses
 
 ```
 Grep: \.select\(\s*['"]?\*|SELECT \*                            # explicit wildcard projection
@@ -946,7 +946,7 @@ Grep: res\.json\(user\)|res\.json\(req\.user\)                  # returning a fu
 ```
 An endpoint that returns an entire database row (via `SELECT *` or an ORM call with no field projection) commonly leaks fields never meant for the client: password hashes, internal flags, other users' foreign keys, soft-delete markers, admin notes. This is a real, frequent finding independent of whether the frontend happens to only display some of the fields — the full object is still visible in devtools/network tab. Flag as **MEDIUM**–**HIGH** depending on what's actually in the leaked fields (password hash present = CRITICAL).
 
-### 6.4 — Session fixation
+### 7.4 — Session fixation
 
 ```
 Grep: (login|signIn|authenticate).*\(req|Grep: req\.session\.\w+\s*=      # find login handlers / session writes
@@ -954,21 +954,21 @@ Grep: \.regenerate\(                                                       # fin
 ```
 Locate the login handler (first pattern), then check with `-A 15` context (or read the surrounding function) whether it calls `req.session.regenerate()` (Express) or the framework's equivalent **before** writing the authenticated user into the session. If a login handler sets session data but no `regenerate()` call appears anywhere in the same file, the session ID likely isn't rotated on login — an attacker who fixes a victim's pre-login session ID (e.g. via a shared link containing a session cookie) can hijack the now-authenticated session. Flag as **HIGH**.
 
-### 6.5 — CSRF on state-changing GET requests
+### 7.5 — CSRF on state-changing GET requests
 
 ```
 Grep: (app|router)\.get\(['"].*\/(delete|remove|update|approve|cancel)   # state-changing action bound to GET
 ```
 Any endpoint that mutates state (delete, cancel, approve, unsubscribe) and responds to `GET` is CSRF-exploitable via a plain `<img src=...>` or link — no JS, no CORS restrictions apply to simple GET navigation. Should be `POST`/`DELETE` behind CSRF protection. Flag as **HIGH**.
 
-### 6.6 — Timing / message-based user enumeration
+### 7.6 — Timing / message-based user enumeration
 
 ```
 Grep: (User|Usuario) not found|Invalid (email|password|credentials) — check if login/reset-password returns DIFFERENT messages for "no such user" vs "wrong password"
 ```
 A login or password-reset flow that says "no existe esa cuenta" vs. "contraseña incorrecta" lets an attacker enumerate valid emails/usernames at scale. Fix: always return the same generic message ("credenciales inválidas") and, ideally, similar response timing, regardless of which check failed.
 
-### 6.7 — Prototype pollution (JavaScript)
+### 7.7 — Prototype pollution (JavaScript)
 
 ```
 Grep: _\.merge\(|_\.defaultsDeep\(|Object\.assign\(\s*\{\s*\}\s*,.*req\.body
@@ -976,7 +976,7 @@ Grep: \[.*req\.(body|query|params).*\]\s*=              # dynamic key assignment
 ```
 Deep-merging user-controlled input (`lodash.merge`, hand-rolled recursive merge, dynamic bracket-notation assignment) without blocking `__proto__`/`constructor`/`prototype` keys can pollute `Object.prototype` globally, leading to app-wide logic corruption or, in some frameworks, RCE. Flag as **HIGH**. Fix: use `structuredClone` + explicit allow-listed fields, or a merge library with prototype-pollution protection (lodash ≥ 4.17.21 patched this for its own `merge`, but hand-rolled merges remain vulnerable).
 
-### 6.8 — ReDoS (catastrophic backtracking regex)
+### 7.8 — ReDoS (catastrophic backtracking regex)
 
 ```
 Grep: \([^)]*[+*]\)[+*]                                # nested quantifiers like (a+)+ or (a*)*
@@ -984,14 +984,14 @@ Grep: RegExp\(.*req\.(body|query)                       # regex built from user 
 ```
 A regex with nested quantifiers evaluated against attacker-controlled, adversarially-crafted input (especially in validation for emails, URLs, or "looks like X" checks) can hang the event loop for seconds to minutes on a short malicious string — a cheap single-request DoS. Flag as **MEDIUM**, **HIGH** if the vulnerable regex sits on an unauthenticated, public-facing endpoint (contact form, signup).
 
-### 6.9 — Dependency confusion
+### 7.9 — Dependency confusion
 
 ```
 Grep in package.json: "name":\s*"@[a-z0-9-]+/     — check if that scope is actually reserved/private on npm
 ```
 An internal/private package referenced with a scope that isn't actually registered as private on the public npm registry can be squatted by an attacker who publishes a malicious package under that exact name — if the build ever resolves to the public registry (misconfigured `.npmrc`, missing private registry auth), it installs the attacker's code instead. Verify `.npmrc` pins internal scopes to a private registry explicitly.
 
-### 6.10 — Open redirect via OAuth / return_to parameters
+### 7.10 — Open redirect via OAuth / return_to parameters
 
 ```
 Grep: redirect_uri=|return_to=|next=.*req\.(query|params)
@@ -999,7 +999,7 @@ res\.redirect\(req\.(query|body)\.(url|redirect|next|return_to)\)
 ```
 An unvalidated `redirect_uri`/`return_to`/`next` parameter, especially in an OAuth flow, lets an attacker craft a legitimate-looking login link that redirects the victim (with a valid session/token in the URL fragment or query) to an attacker-controlled domain after authentication. Flag as **HIGH**. Fix: validate against an explicit allowlist of same-origin paths, never accept an absolute external URL.
 
-### 6.11 — GraphQL-specific (only if a GraphQL layer is detected)
+### 7.11 — GraphQL-specific (only if a GraphQL layer is detected)
 
 ```
 Grep in deps: "graphql", "apollo-server", "graphql-yoga", "@apollo/server"
