@@ -117,6 +117,15 @@ This detection covers the frontend framework only. If the project also uses Supa
 - Marketplaces: seller commission/payout computed client-side
 - Multi-tenant isolation: tenant/organization must come from the session, never a URL/body parameter
 
+**Race conditions & business-logic invariants (TOCTOU, check-then-act) — runs on every project, no trigger needed:**
+- Quotas/limits/counters checked and incremented in two separate steps instead of one atomic statement (monthly/rate limit bypass under concurrency)
+- One-time tokens (password reset, OTP, invite) consumed non-atomically — the same token can succeed twice in parallel
+- Idempotency keys stored only in a single process's memory, or not scoped to the calling principal
+- Uniqueness (one account per email, one order per click) enforced only in application code, with no backing DB unique constraint
+- State-machine transitions (pending→approved→shipped→refunded) applied without validating the current state first — enables double refunds or out-of-order steps
+- Inventory/seat/booking reservations with no atomic release path on abandonment or timeout
+- Recommended validation: a real concurrent-request test (with explicit authorization) before reporting CRITICAL/HIGH severity
+
 **Advanced & less common vectors (but real):**
 - JWT algorithm confusion (RS256/HS256)
 - IDOR via sequential/enumerable IDs

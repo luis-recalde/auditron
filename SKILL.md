@@ -40,7 +40,7 @@ Classify the project. Use the first match:
 
 Announce: `Stack detectado: [STACK]. Adaptando auditoría...`
 
-**Backend-as-a-Service, workflow automation, monetization, and cloud infrastructure are orthogonal layers, not Phase 1 categories.** A project is classified above by its *frontend/framework* stack, but separately check for: a BaaS backend (Supabase, Firebase → Phase 4), n8n or another workflow-automation layer (→ Phase 5), a monetization layer (payments, subscriptions, marketplace → Phase 6), and Terraform/Kubernetes/cloud IAM config (→ Phase 8) — each triggers independently of which row matched above. A `REACT` project with `@supabase/supabase-js` in its dependencies is still `REACT` for Phase 1 purposes, but it also gets the full Phase 4 database-privilege audit; a project with no frontend framework at all but a `terraform/` directory still gets Phase 8. Never skip an orthogonal phase just because the project matched (or didn't cleanly match) a frontend-only row here.
+**Backend-as-a-Service, workflow automation, monetization, cloud infrastructure, and concurrency safety are orthogonal layers, not Phase 1 categories.** A project is classified above by its *frontend/framework* stack, but separately check for: a BaaS backend (Supabase, Firebase → Phase 4), n8n or another workflow-automation layer (→ Phase 5), a monetization layer (payments, subscriptions, marketplace → Phase 6), and Terraform/Kubernetes/cloud IAM config (→ Phase 9) — each triggers independently of which row matched above. Phase 7 (race conditions / business-logic invariants) needs no trigger at all — every stack has read-modify-write code somewhere, so run it unconditionally. A `REACT` project with `@supabase/supabase-js` in its dependencies is still `REACT` for Phase 1 purposes, but it also gets the full Phase 4 database-privilege audit; a project with no frontend framework at all but a `terraform/` directory still gets Phase 9. Never skip an orthogonal phase just because the project matched (or didn't cleanly match) a frontend-only row here.
 
 ---
 
@@ -739,7 +739,7 @@ Cross-reference every bucket's `public` value against what's actually stored in 
 Grep: storage\.from\(['"]?(\w+)['"]?\)\.upload            # which bucket receives which kind of file
 Grep: createBucket\(.*public.*true                         # bucket created as public in code, if applicable
 ```
-A bucket with `public: true` is only a finding if what it stores is sensitive — **not every public bucket is a bug**: logos, marketing images, and public floor-plan renders are fine public by design. A bucket holding user-uploaded ID scans, contracts, invoices, or paywalled digital assets (Phase 5.7) marked `public: true` is **CRITICAL** — anyone with the object's URL (often guessable/sequential) can read it with no auth at all. Read what the corresponding `upload()` call in the app actually stores before deciding severity.
+A bucket with `public: true` is only a finding if what it stores is sensitive — **not every public bucket is a bug**: logos, marketing images, and public floor-plan renders are fine public by design. A bucket holding user-uploaded ID scans, contracts, invoices, or paywalled digital assets (Phase 6.7) marked `public: true` is **CRITICAL** — anyone with the object's URL (often guessable/sequential) can read it with no auth at all. Read what the corresponding `upload()` call in the app actually stores before deciding severity.
 
 ### 4.7 — Edge Functions / serverless functions bypassing auth
 
@@ -862,7 +862,7 @@ If the checkout/order-creation endpoint accepts `amount`, `price`, or `plan_id` 
 
 ### 6.3 — Payment webhook integrity (signature + replay)
 
-Beyond just "is the signature checked" (already covered in Phase 9 for MercadoPago) — two more common gaps:
+Beyond just "is the signature checked" (already covered in Phase 13 for MercadoPago) — two more common gaps:
 ```
 Grep: stripe\.webhooks\.constructEvent          # present = good, check it's actually used before processing
 Grep: (webhook|event)\.id.*(processed|seen|idempotenc)  # idempotency/replay check
@@ -916,11 +916,83 @@ Every query for a resource scoped to a tenant/organization/creator must filter b
 
 ---
 
-## PHASE 7 — ADVANCED & RARE ATTACK VECTORS
+## PHASE 7 — RACE CONDITIONS & BUSINESS-LOGIC INVARIANTS (TOCTOU, check-then-act, quota/limit bypass)
+
+**Trigger this phase on every audit, regardless of stack** — unlike Phase 6, this doesn't need a payment layer to apply. Every application has *some* read-modify-write sequence (a quota, a uniqueness check, an inventory count, a one-time-token consumption), and this class is consistently under-tested because the code is correct read top-to-bottom in isolation — the bug only exists in the gap between two concurrent requests, not within either one alone. A single-request code review will never surface it; you have to think in terms of what happens when the same action arrives twice at once.
+
+```
+Grep: SELECT .* FROM .*(quota|usage|count|limit|balance|credits)
+Grep: (usage|quota|count|balance|credits)\s*(<|<=|>=|>)\s*(limit|max|threshold)
+Grep: findFirst\(|findUnique\(|findOne\(                              # candidate "check" half of a check-then-act pair — read forward from each hit
+```
+None of this reduces to one reliable grep the way a secret pattern does (same caveat as 6.1) — these are anchors to find candidate check-then-act sequences, not the check itself. For each hit, read forward: is the check and the resulting write performed in one atomic database statement, or as two separate round trips with application code deciding what to do in between? The second shape is racy regardless of how correct the logic looks, because concurrent requests can all complete the "check" before any of them completes the "write."
+
+### 7.1 — Non-atomic check-then-act on quotas, limits, and counters
+
+The highest-value instance of this class: any monthly/daily usage cap, rate-limited action, or balance check implemented as SELECT-then-UPDATE. N concurrent requests all read the same pre-increment value, all pass the check, and all proceed — the limit is enforced in name only. This is especially costly when the gated action calls a paid third-party API per request (AI generation, SMS, email — see Phase 6.8's wallet-attack framing): the race doesn't just bypass the limit, it multiplies the attacker's cost-inflicting leverage by however many requests they can fire concurrently. Flag **HIGH**; **CRITICAL** if the gated action moves money, mints a paid entitlement, or the third-party cost per call is non-trivial.
+
+**Fix pattern (Postgres, same shape regardless of ORM):**
+```sql
+-- BAD: two round trips, race window between them
+SELECT count FROM usage WHERE user_id = $1;            -- app checks count < limit
+UPDATE usage SET count = count + 1 WHERE user_id = $1; -- app calls this only if the check above passed
+
+-- GOOD: the check and the increment are the SAME atomic statement — no window exists for a second request to land in
+INSERT INTO usage (user_id, count) VALUES ($1, 1)
+ON CONFLICT (user_id) DO UPDATE SET count = usage.count + 1
+WHERE usage.count < $2
+RETURNING count;
+-- if RETURNING yields no row, the limit was already reached; the caller never
+-- observes a stale pre-increment value to "pass" a check against
+```
+Where the gated action can fail or turn out not to count (a clarifying question instead of a real generation, a payment that didn't capture), reserve the slot atomically *before* the expensive/costed call and refund it if the attempt doesn't end up counting — never reserve after the call succeeds, which recreates the exact race this section exists to close.
+
+### 7.2 — One-time token / code consumption races
+
+```
+Grep: (reset_token|resetToken|otp|magic_link|invite_code|verification_code).*(findOne|findUnique|SELECT)
+```
+Password reset tokens, OTPs, magic links, and invite codes must be validated and marked-used in the same atomic statement, not validated then separately marked used afterward. Two concurrent requests presenting the same still-valid one-time token should not both succeed (e.g. both mint a session, both apply an invite). Flag **HIGH**.
+
+### 7.3 — Idempotency key scope and enforcement
+
+```
+Grep: idempotency-?key|Idempotency-Key
+```
+Check where the key is persisted — a DB unique constraint survives concurrent requests and process restarts; an in-memory `Map`/cache on a single instance does not (breaks the moment there's more than one server process, which is the default for most Node/Python/PHP deployments, not an edge case). Check what the key is scoped to: a key scoped only to a path/endpoint, without the calling principal, lets one user replay another user's idempotency key onto their own request. Check the write ordering: the key must be persisted in the same transaction as the side effect — writing it beforehand permanently blocks a legitimate retry if the operation then fails, writing it well after leaves a crash window where a retry duplicates the side effect.
+
+### 7.4 — Uniqueness enforced only in application code, not the database
+
+```
+Grep: findFirst\(.*\).*create\(|findOne\(.*\).*save\(
+```
+"Check it doesn't exist yet, then create it" without a backing DB-level `UNIQUE` constraint (or `ON CONFLICT DO NOTHING`/upsert) allows duplicate rows under concurrent requests: duplicate accounts for one email, duplicate orders from a double-click or a retried request, seat assignments past a hard cap. Flag **MEDIUM**, **HIGH** if the duplicate has a financial or access-control consequence.
+
+### 7.5 — State-machine step skipping, reordering, and double-transition
+
+```
+Grep: status\s*(===|==|!=)\s*['"](pending|approved|shipped|refunded|cancelled|captured)
+```
+For any workflow with an explicit status field (order, approval, subscription, KYC), every transition endpoint must validate the CURRENT state server-side before applying the next one — not just that a status field exists somewhere. If "refund" doesn't check the order is currently "captured" (not already "refunded", not still "pending"), a client can call it twice for a double refund, or call a later step before an earlier one by hitting endpoints directly instead of going through the UI's intended order. Flag **HIGH** if the skipped/repeated step has a financial consequence.
+
+### 7.6 — Reservation/hold leaks (inventory, seats, bookings)
+
+```
+Grep: (reserve|hold|lock)(Seat|Inventory|Slot|Booking)
+```
+If a "reserve" step decrements available inventory/seats but the matching "release on timeout/abandon" path is missing or itself non-atomic, abandoned concurrent reservations can permanently leak capacity (shows sold out with no matching completed orders), or — in the other direction — a release racing a confirm can double-book the same seat/slot. Flag **MEDIUM**.
+
+**Validating a race-condition finding (do this before reporting CRITICAL/HIGH severity on this phase):** pointing at a non-atomic sequence in the code is a plausible finding, not a confirmed one — the same code sometimes "looks fine" until it's actually stressed. With explicit user authorization (same standing rule as the live RLS test in Phase 4.5 — ask first, always, especially against anything production or otherwise live), fire N concurrent identical requests (`Promise.all` of N `fetch` calls, or N parallel curl invocations) at the real endpoint and compare the resulting durable state (the DB row, the ledger) against what a single sequential request would have produced. If 5 concurrent requests against a limit of 2 all return success and the counter only advances by 1 (lost updates) or by 5 (limit bypassed), that is the proof — durable, reproducible, and far more convincing to report than "this code looks racy."
+
+**False positives:** the check and the write ARE already in the same statement (`UPDATE ... WHERE ... RETURNING`, a unique index, `SELECT ... FOR UPDATE` inside a transaction); a genuinely single-process deployment with serialized request handling and no plan to scale horizontally (rare — verify, don't take this claim at face value); or a truly idempotent operation (`ON CONFLICT DO NOTHING` on a natural key) where a duplicate attempt is a harmless no-op rather than a duplicate state change.
+
+---
+
+## PHASE 8 — ADVANCED & RARE ATTACK VECTORS
 
 These are lower-frequency but well-documented, real vulnerability classes that don't fit cleanly into the OWASP Top 10 buckets above. Check for them on every audit regardless of stack; skip silently (no need to report "not applicable") when a pattern genuinely can't apply (e.g. GraphQL checks on a project with no GraphQL layer).
 
-### 7.1 — JWT algorithm confusion
+### 8.1 — JWT algorithm confusion
 
 **Ripgrep doesn't support lookaround** (`(?!...)`) — don't write a pattern that depends on it, it will silently match nothing and look like a clean bill of health. Grep for the anchor, then read each result to judge the negative condition:
 ```
@@ -929,7 +1001,7 @@ Grep: jwt\.verify\(.*algorithms\s*:\s*\[.*(RS256.*HS256|HS256.*RS256)
 ```
 If `jwt.verify()` is called without an explicit `algorithms: [...]` allowlist, or with both `RS256` and `HS256` accepted, an attacker who knows the RS256 public key (often published, e.g. at a `/.well-known/jwks.json` endpoint or embedded in the frontend) can forge a token signed with HS256 using the public key as the HMAC secret — the library will accept it as valid. **CRITICAL.** Fix: always pass an explicit single-algorithm allowlist matching what the issuer actually uses.
 
-### 7.2 — IDOR via enumerable identifiers
+### 8.2 — IDOR via enumerable identifiers
 
 ```
 Grep: id\s+(SERIAL|INTEGER|BIGINT)\s+PRIMARY KEY      # auto-increment PK — check if that table's id is ever used in a public URL/route
@@ -937,7 +1009,7 @@ Grep: /:(id|invoiceId|orderId|userId)\b               # route params — cross-r
 ```
 Beyond "is there an ownership check" (Phase 3, A01) — even WITH an ownership check, using sequential integer IDs as public-facing identifiers (`/invoice/1042`, `/order/883`) lets an attacker infer the existence and approximate volume of other users' records, and turns any future ownership-check regression into full enumeration. Recommend UUIDs (or ULIDs if ordering matters) for any publicly-referenced resource ID.
 
-### 7.3 — Excessive data exposure in API responses
+### 8.3 — Excessive data exposure in API responses
 
 ```
 Grep: \.select\(\s*['"]?\*|SELECT \*                            # explicit wildcard projection
@@ -946,7 +1018,7 @@ Grep: res\.json\(user\)|res\.json\(req\.user\)                  # returning a fu
 ```
 An endpoint that returns an entire database row (via `SELECT *` or an ORM call with no field projection) commonly leaks fields never meant for the client: password hashes, internal flags, other users' foreign keys, soft-delete markers, admin notes. This is a real, frequent finding independent of whether the frontend happens to only display some of the fields — the full object is still visible in devtools/network tab. Flag as **MEDIUM**–**HIGH** depending on what's actually in the leaked fields (password hash present = CRITICAL).
 
-### 7.4 — Session fixation
+### 8.4 — Session fixation
 
 ```
 Grep: (login|signIn|authenticate).*\(req|Grep: req\.session\.\w+\s*=      # find login handlers / session writes
@@ -954,21 +1026,21 @@ Grep: \.regenerate\(                                                       # fin
 ```
 Locate the login handler (first pattern), then check with `-A 15` context (or read the surrounding function) whether it calls `req.session.regenerate()` (Express) or the framework's equivalent **before** writing the authenticated user into the session. If a login handler sets session data but no `regenerate()` call appears anywhere in the same file, the session ID likely isn't rotated on login — an attacker who fixes a victim's pre-login session ID (e.g. via a shared link containing a session cookie) can hijack the now-authenticated session. Flag as **HIGH**.
 
-### 7.5 — CSRF on state-changing GET requests
+### 8.5 — CSRF on state-changing GET requests
 
 ```
 Grep: (app|router)\.get\(['"].*\/(delete|remove|update|approve|cancel)   # state-changing action bound to GET
 ```
 Any endpoint that mutates state (delete, cancel, approve, unsubscribe) and responds to `GET` is CSRF-exploitable via a plain `<img src=...>` or link — no JS, no CORS restrictions apply to simple GET navigation. Should be `POST`/`DELETE` behind CSRF protection. Flag as **HIGH**.
 
-### 7.6 — Timing / message-based user enumeration
+### 8.6 — Timing / message-based user enumeration
 
 ```
 Grep: (User|Usuario) not found|Invalid (email|password|credentials) — check if login/reset-password returns DIFFERENT messages for "no such user" vs "wrong password"
 ```
 A login or password-reset flow that says "no existe esa cuenta" vs. "contraseña incorrecta" lets an attacker enumerate valid emails/usernames at scale. Fix: always return the same generic message ("credenciales inválidas") and, ideally, similar response timing, regardless of which check failed.
 
-### 7.7 — Prototype pollution (JavaScript)
+### 8.7 — Prototype pollution (JavaScript)
 
 ```
 Grep: _\.merge\(|_\.defaultsDeep\(|Object\.assign\(\s*\{\s*\}\s*,.*req\.body
@@ -976,7 +1048,7 @@ Grep: \[.*req\.(body|query|params).*\]\s*=              # dynamic key assignment
 ```
 Deep-merging user-controlled input (`lodash.merge`, hand-rolled recursive merge, dynamic bracket-notation assignment) without blocking `__proto__`/`constructor`/`prototype` keys can pollute `Object.prototype` globally, leading to app-wide logic corruption or, in some frameworks, RCE. Flag as **HIGH**. Fix: use `structuredClone` + explicit allow-listed fields, or a merge library with prototype-pollution protection (lodash ≥ 4.17.21 patched this for its own `merge`, but hand-rolled merges remain vulnerable).
 
-### 7.8 — ReDoS (catastrophic backtracking regex)
+### 8.8 — ReDoS (catastrophic backtracking regex)
 
 ```
 Grep: \([^)]*[+*]\)[+*]                                # nested quantifiers like (a+)+ or (a*)*
@@ -984,14 +1056,14 @@ Grep: RegExp\(.*req\.(body|query)                       # regex built from user 
 ```
 A regex with nested quantifiers evaluated against attacker-controlled, adversarially-crafted input (especially in validation for emails, URLs, or "looks like X" checks) can hang the event loop for seconds to minutes on a short malicious string — a cheap single-request DoS. Flag as **MEDIUM**, **HIGH** if the vulnerable regex sits on an unauthenticated, public-facing endpoint (contact form, signup).
 
-### 7.9 — Dependency confusion
+### 8.9 — Dependency confusion
 
 ```
 Grep in package.json: "name":\s*"@[a-z0-9-]+/     — check if that scope is actually reserved/private on npm
 ```
 An internal/private package referenced with a scope that isn't actually registered as private on the public npm registry can be squatted by an attacker who publishes a malicious package under that exact name — if the build ever resolves to the public registry (misconfigured `.npmrc`, missing private registry auth), it installs the attacker's code instead. Verify `.npmrc` pins internal scopes to a private registry explicitly.
 
-### 7.10 — Open redirect via OAuth / return_to parameters
+### 8.10 — Open redirect via OAuth / return_to parameters
 
 ```
 Grep: redirect_uri=|return_to=|next=.*req\.(query|params)
@@ -999,7 +1071,7 @@ res\.redirect\(req\.(query|body)\.(url|redirect|next|return_to)\)
 ```
 An unvalidated `redirect_uri`/`return_to`/`next` parameter, especially in an OAuth flow, lets an attacker craft a legitimate-looking login link that redirects the victim (with a valid session/token in the URL fragment or query) to an attacker-controlled domain after authentication. Flag as **HIGH**. Fix: validate against an explicit allowlist of same-origin paths, never accept an absolute external URL.
 
-### 7.11 — GraphQL-specific (only if a GraphQL layer is detected)
+### 8.11 — GraphQL-specific (only if a GraphQL layer is detected)
 
 ```
 Grep in deps: "graphql", "apollo-server", "graphql-yoga", "@apollo/server"
@@ -1007,7 +1079,7 @@ Grep: introspection:\s*true                              # introspection left on
 Grep: depthLimit|queryComplexity|costAnalysis             # presence = good, absence = check further
 Grep: resolve:\s*\(|resolve\s*\(                          # enumerate every resolver — read each one, don't rely on a regex for the auth check itself
 ```
-For every resolver found, read its body for a permission check — GraphQL's single-endpoint-many-fields shape means **REST-style route-level auth checks don't exist here**; every resolver that returns sensitive data needs its own check, and it's common for a schema to correctly protect its Query root fields while a nested field resolver (e.g. `User.privateNotes`) has none, because it's reachable through a different, less obviously-sensitive parent query. This is a manual-read step, the same way Phase 5.1's paywall check is — the presence/absence of an auth check inside a function body isn't reliably expressible as a single grep pattern.
+For every resolver found, read its body for a permission check — GraphQL's single-endpoint-many-fields shape means **REST-style route-level auth checks don't exist here**; every resolver that returns sensitive data needs its own check, and it's common for a schema to correctly protect its Query root fields while a nested field resolver (e.g. `User.privateNotes`) has none, because it's reachable through a different, less obviously-sensitive parent query. This is a manual-read step, the same way Phase 6.1's paywall check is — the presence/absence of an auth check inside a function body isn't reliably expressible as a single grep pattern.
 
 Check for:
 - **Introspection enabled in production** — exposes the entire schema, including unused/admin-only fields, to anyone. Should be disabled outside development.
@@ -1015,11 +1087,11 @@ Check for:
 - **Missing query depth/complexity limiting** — a deeply nested or circular query can cause exponential resolver calls, a DoS vector essentially unique to GraphQL's shape.
 - **Batching with no per-batch rate limiting** — a batched request turns a rate limit designed for "1 request" into unlimited effective operations per HTTP call.
 - **Verbose errors** — default Apollo/GraphQL error formatting can leak resolver stack traces and internal field names to the client; check for a custom `formatError` that strips internals in production.
-- **State-changing mutations over GET with cookie auth** — if the GraphQL endpoint accepts queries via `GET` (some setups do, for caching) and auth relies on cookies, mutations become CSRF-exploitable the same way as Phase 6.5 — mutations should only be reachable via `POST`.
+- **State-changing mutations over GET with cookie auth** — if the GraphQL endpoint accepts queries via `GET` (some setups do, for caching) and auth relies on cookies, mutations become CSRF-exploitable the same way as Phase 8.5 — mutations should only be reachable via `POST`.
 
 ---
 
-## PHASE 8 — CLOUD INFRASTRUCTURE & IaC SECURITY (Terraform, CloudFormation, Kubernetes, cloud IAM)
+## PHASE 9 — CLOUD INFRASTRUCTURE & IaC SECURITY (Terraform, CloudFormation, Kubernetes, cloud IAM)
 
 **Trigger this phase when ANY of:**
 ```
@@ -1028,16 +1100,16 @@ Glob: **/*.yaml, **/*.yml — check for `kind: Deployment|Pod|Service|Role|Clust
 Glob: **/cloudformation*.yaml, **/cloudformation*.json, **/template.yaml (SAM)
 Glob: **/*.tf.json, **/pulumi/**, **/cdk.out/**
 ```
-This phase is distinct from Phase 11 (Infrastructure & Config Review) — that one covers app-level Docker/CI-CD hygiene; this one covers cloud provider permission models and orchestration configs, a different failure class (identity and access management, not application config).
+This phase is distinct from Phase 12 (Infrastructure & Config Review) — that one covers app-level Docker/CI-CD hygiene; this one covers cloud provider permission models and orchestration configs, a different failure class (identity and access management, not application config).
 
-### 8.1 — Terraform state file exposure
+### 9.1 — Terraform state file exposure
 
 ```
 Glob: **/terraform.tfstate, **/*.tfstate
 ```
 A `.tfstate` file contains **plaintext values of every resource it manages, including secrets** — database passwords, generated API keys, private keys — even for resources whose Terraform definition marks the input variable `sensitive = true` (that flag only redacts CLI output, not the state file itself). A `.tfstate` file committed to git, or stored in an S3 backend bucket without encryption and strict access policy, is **CRITICAL**. Fix: remote state backend (S3+DynamoDB lock, Terraform Cloud) with encryption at rest and IAM-restricted access; never commit state; if one was ever committed, treat every secret in it as compromised and rotate.
 
-### 8.2 — Overly broad IAM policies
+### 9.2 — Overly broad IAM policies
 
 ```
 Grep: "Action":\s*"\*"                                    # AWS IAM wildcard action
@@ -1047,7 +1119,7 @@ Grep: AssumeRolePolicyDocument.*"Principal":\s*"\*"        # any AWS account can
 ```
 A policy combining `"Action": "*"` with `"Resource": "*"` grants full administrative access to whatever it's attached to — flag as **CRITICAL** on any role/user attached to an application workload (a Lambda's execution role, an EC2 instance profile, a CI/CD deploy user) rather than a genuinely break-glass human admin role. Recommend scoping to the specific actions and ARNs the workload actually needs.
 
-### 8.3 — Public storage bucket / object storage misconfiguration
+### 9.3 — Public storage bucket / object storage misconfiguration
 
 ```
 Grep: "BlockPublicAcls":\s*false|"BlockPublicPolicy":\s*false     # AWS API/CloudFormation JSON style
@@ -1055,9 +1127,9 @@ Grep: block_public_acls\s*=\s*false|block_public_policy\s*=\s*false|restrict_pub
 Grep: acl\s*=\s*"public-read"|acl\s*=\s*"public-read-write"        # Terraform S3 bucket ACL
 Grep: allUsers|allAuthenticatedUsers                                # GCP bucket IAM binding to anyone
 ```
-Same reasoning as Phase 4.6 (Supabase storage) — a bucket is only a finding if what it stores is sensitive. Cross-reference against what the application actually writes there before assigning severity; a bucket serving public static assets is fine, one holding backups, user uploads, or Terraform state (8.1) is **CRITICAL**.
+Same reasoning as Phase 4.6 (Supabase storage) — a bucket is only a finding if what it stores is sensitive. Cross-reference against what the application actually writes there before assigning severity; a bucket serving public static assets is fine, one holding backups, user uploads, or Terraform state (9.1) is **CRITICAL**.
 
-### 8.4 — Kubernetes: privileged/root containers and missing isolation
+### 9.4 — Kubernetes: privileged/root containers and missing isolation
 
 ```
 Grep: privileged:\s*true
@@ -1067,7 +1139,7 @@ Grep: allowPrivilegeEscalation:\s*true
 ```
 A container running `privileged: true` or as `runAsUser: 0` (root) with no explicit `securityContext` restricting capabilities can, if compromised via any application-layer vulnerability inside it, escalate to control the underlying node — a much larger blast radius than the container itself. `hostNetwork`/`hostPID`/`hostIPC: true` similarly break the isolation Kubernetes is supposed to provide between workloads on the same node. Flag as **HIGH**, **CRITICAL** if the container also handles untrusted input (a public-facing API, a webhook receiver, a sandboxed code-execution service).
 
-### 8.5 — Kubernetes: secrets as plain environment variables, missing NetworkPolicy
+### 9.5 — Kubernetes: secrets as plain environment variables, missing NetworkPolicy
 
 ```
 Grep: kind:\s*Deployment — check nearby env: for value: (rather than valueFrom: secretKeyRef:)
@@ -1075,7 +1147,7 @@ Grep: kind:\s*NetworkPolicy                                # presence check — 
 ```
 Secrets injected via a literal `value:` in a Deployment/Pod spec (instead of `valueFrom: secretKeyRef:` pointing at a Kubernetes `Secret` object) end up readable by anyone with `kubectl describe pod`/`get pod -o yaml` access, and are stored in etcd with the same exposure either way — but the literal form also leaks into version control and CI logs where the spec is defined. Flag as **MEDIUM**. Separately, a cluster with zero `NetworkPolicy` resources defined means every pod can reach every other pod by default ("flat network") — a compromised low-value service (e.g. a public frontend) can then directly reach a database or internal admin service with no network-layer barrier. Flag as **MEDIUM**–**HIGH** depending on what's reachable.
 
-### 8.6 — CI/CD deploy credentials with standing cloud access
+### 9.6 — CI/CD deploy credentials with standing cloud access
 
 ```
 Grep in .github/workflows, .gitlab-ci.yml: AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY   # long-lived static keys in CI
@@ -1085,7 +1157,7 @@ Long-lived AWS/GCP/Azure static credentials stored as CI secrets are a standing 
 
 ---
 
-## PHASE 9 — CWE TOP 25 (by language)
+## PHASE 10 — CWE TOP 25 (by language)
 
 ### JavaScript / TypeScript
 - **CWE-79** (XSS): `dangerouslySetInnerHTML`, `innerHTML =`, `document.write`, unescaped template literals in HTML
@@ -1140,7 +1212,7 @@ eval\s*\(\$_                      # PHP eval injection
 
 ---
 
-## PHASE 10 — SECURITY HEADERS
+## PHASE 11 — SECURITY HEADERS
 
 Check the project's HTTP header configuration. Look in:
 - `next.config.js` / `next.config.ts` / `next.config.mjs`
@@ -1223,7 +1295,7 @@ async def add_security_headers(request, call_next):
 
 ---
 
-## PHASE 11 — INFRASTRUCTURE & CONFIG REVIEW
+## PHASE 12 — INFRASTRUCTURE & CONFIG REVIEW
 
 ### .env file exposure
 ```
@@ -1272,7 +1344,7 @@ on:\s*pull_request_target                # Dangerous event — can access secret
 
 ---
 
-## PHASE 12 — LATAM-SPECIFIC CHECKS
+## PHASE 13 — LATAM-SPECIFIC CHECKS
 
 ### MercadoPago
 ```
@@ -1317,7 +1389,7 @@ function validateMPWebhook(req: Request): boolean {
 
 ---
 
-## PHASE 13 — DEPENDENCY AUDIT
+## PHASE 14 — DEPENDENCY AUDIT
 
 Run the appropriate command based on detected stack:
 
@@ -1362,7 +1434,7 @@ composer audit 2>/dev/null
 
 ---
 
-## PHASE 14 — SCORING ENGINE
+## PHASE 15 — SCORING ENGINE
 
 Calculate score starting from 100. Apply deductions:
 
@@ -1377,15 +1449,19 @@ CRITICAL findings:
   - Client-side-only paywall / entitlement bypass:   -20 each (max -40)   [Phase 6.1]
   - Insecure deserialization:                        -15 each (max -30)
   - CRITICAL CVE in dependency:                      -15 each (max -30)
-  - JWT algorithm confusion (no alg allowlist):      -20 each (max -40)   [Phase 7.1]
+  - JWT algorithm confusion (no alg allowlist):      -20 each (max -40)   [Phase 8.1]
   - N8N_ENCRYPTION_KEY committed/hardcoded:          -25 each (max -50)   [Phase 5.5]
   - n8n instance with no auth (internet-facing):     -20 each (max -40)   [Phase 5.5]
   - Command/code injection via n8n Code/Execute      -20 each (max -40)   [Phase 5.3]
     Command node fed by external input:
-  - Terraform state file (.tfstate) committed        -20 each (max -40)   [Phase 8.1]
+  - Terraform state file (.tfstate) committed        -20 each (max -40)   [Phase 9.1]
     to git (plaintext secrets):
-  - IAM policy: Action:* + Resource:* on a           -20 each (max -40)   [Phase 8.2]
+  - IAM policy: Action:* + Resource:* on a           -20 each (max -40)   [Phase 9.2]
     workload identity (not a human admin role):
+  - Race condition on a check-then-act gating a       -20 each (max -40)   [Phase 7.1]
+    money-moving or paid-entitlement action:
+  - State-machine transition (refund/capture/ship)    -20 each (max -40)   [Phase 7.5]
+    reachable twice or out of order with financial impact:
 
 HIGH findings:
   - Hardcoded credentials (non-production):          -10 each (max -20)
@@ -1402,19 +1478,25 @@ HIGH findings:
   - Unprotected digital asset URL (paywall bypass    -10 each (max -20)   [Phase 6.7]
     via direct link):
   - Price/amount trusted from client at checkout:    -12 each (max -24)   [Phase 6.2]
-  - Session fixation (no regenerate on login):       -8 each (max -16)    [Phase 7.4]
-  - CSRF-exploitable state change on GET:            -8 each (max -16)    [Phase 7.5]
-  - Prototype pollution via unguarded deep merge:    -10 each (max -20)   [Phase 7.7]
-  - Open redirect (OAuth/return_to):                 -8 each (max -16)    [Phase 7.10]
+  - Session fixation (no regenerate on login):       -8 each (max -16)    [Phase 8.4]
+  - CSRF-exploitable state change on GET:            -8 each (max -16)    [Phase 8.5]
+  - Prototype pollution via unguarded deep merge:    -10 each (max -20)   [Phase 8.7]
+  - Open redirect (OAuth/return_to):                 -8 each (max -16)    [Phase 8.10]
   - Inline secret in n8n workflow JSON instead of    -10 each (max -20)   [Phase 5.2]
     the credential system:
   - Unauthenticated webhook driving costed/          -8 each (max -16)    [Phase 5.4]
     reputation-sensitive action (no rate limit):
-  - Public cloud storage bucket with sensitive        -12 each (max -24)   [Phase 8.3]
+  - Public cloud storage bucket with sensitive        -12 each (max -24)   [Phase 9.3]
     data (backups, uploads, state files):
-  - Privileged/root Kubernetes container handling    -10 each (max -20)   [Phase 8.4]
+  - Privileged/root Kubernetes container handling    -10 each (max -20)   [Phase 9.4]
     untrusted input:
-  - Long-lived static cloud credentials in CI/CD:    -8 each (max -16)    [Phase 8.6]
+  - Long-lived static cloud credentials in CI/CD:    -8 each (max -16)    [Phase 9.6]
+  - Non-atomic check-then-act on a usage quota/rate   -10 each (max -20)   [Phase 7.1]
+    limit (no financial/entitlement impact):
+  - One-time token/code (OTP, reset, invite) not      -10 each (max -20)   [Phase 7.2]
+    consumed atomically — double-use possible:
+  - Uniqueness enforced only in app code, not a DB    -8 each (max -16)    [Phase 7.4]
+    constraint, with an access-control consequence:
 
 MEDIUM findings:
   - Weak cryptography (MD5/SHA1 for passwords):      -5 each (max -10)
@@ -1422,20 +1504,26 @@ MEDIUM findings:
   - CORS misconfiguration:                           -5 each (max -10)
   - Debug mode in production signals:                -5 (flat)
   - MODERATE CVE in dependency:                      -3 each (max -9)
-  - Excessive data exposure (SELECT * to client):    -5 each (max -10)    [Phase 7.3]
+  - Excessive data exposure (SELECT * to client):    -5 each (max -10)    [Phase 8.3]
   - Free-trial/free-tier abuse (no durable check):   -5 each (max -10)    [Phase 6.5]
-  - Timing/message-based user enumeration:           -4 each (max -8)     [Phase 7.6]
-  - ReDoS-prone regex on public endpoint:            -5 each (max -10)    [Phase 7.8]
+  - Timing/message-based user enumeration:           -4 each (max -8)     [Phase 8.6]
+  - ReDoS-prone regex on public endpoint:            -5 each (max -10)    [Phase 8.8]
   - Broad USING(true)/anon-readable policy on        -5 each (max -10)    [Phase 4.4]
     non-sensitive catalog data (informational risk):
-  - Kubernetes secret as plain env value, or         -5 each (max -10)    [Phase 8.5]
+  - Kubernetes secret as plain env value, or         -5 each (max -10)    [Phase 9.5]
     cluster with no NetworkPolicy at all:
+  - Idempotency key scoped/persisted incorrectly     -5 each (max -10)    [Phase 7.3]
+    (in-memory only, or not scoped to principal):
+  - Reservation/hold leak (inventory, seats,          -5 each (max -10)    [Phase 7.6]
+    bookings) with no atomic release path:
+  - Duplicate-row race with no real consequence       -3 each (max -6)     [Phase 7.4]
+    (uniqueness only informational):
 
 LOW findings:
   - Single missing security header:                  -2 each (max -8)
   - Non-sensitive info in logs:                      -2 each (max -4)
   - Minor misconfigurations:                         -2 each (max -4)
-  - Sequential/enumerable public resource IDs:       -2 each (max -6)     [Phase 7.2]
+  - Sequential/enumerable public resource IDs:       -2 each (max -6)     [Phase 8.2]
   - N8N_SECURE_COOKIE=false on HTTPS-served instance: -2 each (max -4)    [Phase 5.5]
 
 Minimum score: 0
@@ -1452,7 +1540,7 @@ Minimum score: 0
 
 ---
 
-## PHASE 15 — REPORT OUTPUT
+## PHASE 16 — REPORT OUTPUT
 
 Generate the report in this exact format:
 
@@ -1517,7 +1605,7 @@ RESUMEN
 
 ━━━━ CHECKLIST PRE-DEPLOY ━━━━━━━━━━━━━━━━━━━━━━━
 
-<stack-specific checklist — see Phase 16>
+<stack-specific checklist — see Phase 17>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   auditron | Luis Recalde | MIT 2026
@@ -1529,7 +1617,7 @@ If no findings at all in a category, write: `Sin hallazgos en esta categoría.`
 
 ---
 
-## PHASE 16 — PRE-DEPLOY CHECKLISTS
+## PHASE 17 — PRE-DEPLOY CHECKLISTS
 
 ### NEXTJS
 ```
@@ -1669,6 +1757,17 @@ PRE-DEPLOY CHECKLIST — Monetización
 [ ] Si es multi-tenant: el tenant/organización se deriva de la sesión autenticada, nunca de un parámetro de la URL/body
 ```
 
+### CONCURRENCIA / RACE CONDITIONS (aplica a todo proyecto — ver Phase 7)
+```
+PRE-DEPLOY CHECKLIST — Concurrencia
+[ ] Toda cuota/límite/contador (uso mensual, rate limit, balance) se chequea e incrementa en UNA sola sentencia atómica (UPSERT con WHERE, UPDATE...RETURNING), no en dos pasos separados
+[ ] Tokens de un solo uso (reset de contraseña, OTP, invite, magic link) se validan y marcan usados atómicamente — dos requests concurrentes con el mismo token no pueden tener éxito ambas
+[ ] Idempotency keys: persistidas en la base de datos (no solo en memoria de un proceso) y con el principal/usuario autenticado como parte de la clave
+[ ] Unicidad (email único, un pedido por click, un asiento por cupo) respaldada por una constraint UNIQUE en la base de datos, no solo por un "chequear-antes-de-crear" en el código de la aplicación
+[ ] Transiciones de estado (pending→approved→shipped→refunded) validan el estado ACTUAL server-side antes de aplicar la siguiente, no permiten saltar ni repetir un paso
+[ ] Si el hallazgo es CRITICAL/HIGH: se validó con una prueba real de requests concurrentes (con autorización explícita), no solo con lectura de código
+```
+
 ### N8N / AUTOMATIZACIÓN DE WORKFLOWS
 ```
 PRE-DEPLOY CHECKLIST — n8n
@@ -1707,7 +1806,8 @@ PRE-DEPLOY CHECKLIST — Cloud/IaC
 8. **Language** — write the report in the same language the user used to invoke the skill (Spanish or English).
 9. **No hallazgos = good news** — if a section is clean, say so clearly: "Sin hallazgos. ✓"
 10. **Rotate first** — when reporting exposed secrets, always lead with "Rotar la credencial INMEDIATAMENTE" before any code fixes.
-11. **Never skip Phase 4/5/6/8 checks based on Phase 1 alone** — a BaaS backend, an n8n automation layer, a monetization layer, or cloud/IaC config can sit behind or alongside any frontend stack, or exist with no frontend at all. Actually run the trigger checks in each of those phases for every project; only write "fase omitida" after confirming none of the trigger signals matched, not by assumption.
+11. **Never skip Phase 4/5/6/9 checks based on Phase 1 alone** — a BaaS backend, an n8n automation layer, a monetization layer, or cloud/IaC config can sit behind or alongside any frontend stack, or exist with no frontend at all. Actually run the trigger checks in each of those phases for every project; only write "fase omitida" after confirming none of the trigger signals matched, not by assumption.
 12. **Code review ≠ privilege review** — findings in Phase 4 (database privileges, RLS, GRANTs) cannot be fully confirmed by reading `schema.sql` alone if that file might be stale. Say so explicitly in the report when a live `supabase db dump --linked` wasn't possible, so the user knows the finding's confidence level.
 13. **Ask before testing live** — the live RLS-simulation technique in Phase 4.5 touches a real database (even if only `SELECT`/read-only `SET ROLE` simulation). Always get explicit user confirmation before running it against a production or otherwise live project, and always clean up any disposable test accounts created for the test before closing the audit.
-14. **Business logic over pattern-matching in Phase 5** — monetization/entitlement bugs rarely match a clean regex the way a hardcoded secret does. Read the actual request/response flow for checkout, webhook, and paywall-gated endpoints; a missing grep hit is not the same as "no finding" for this phase.
+14. **Business logic over pattern-matching in Phase 6** — monetization/entitlement bugs rarely match a clean regex the way a hardcoded secret does. Read the actual request/response flow for checkout, webhook, and paywall-gated endpoints; a missing grep hit is not the same as "no finding" for this phase. The same applies to Phase 7 (race conditions) — the atomicity of a check-then-act sequence is a property you verify by reading the transaction boundary, not by grep alone.
+15. **Prefer live concurrency proof for race-condition findings** — per Phase 7, a CRITICAL/HIGH race-condition finding is far more convincing (and far less likely to be a false positive) with an actual concurrent-request reproduction than with "this code looks non-atomic." Ask before firing concurrent requests at a live/production instance, same as Rule 13.

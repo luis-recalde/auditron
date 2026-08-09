@@ -117,6 +117,15 @@ Esta detección es solo del framework de frontend. Si el proyecto además usa Su
 - Marketplaces: comisión/payout del vendedor calculado del lado del cliente
 - Aislamiento multi-tenant: el tenant/organización debe derivarse de la sesión, nunca de un parámetro de la URL
 
+**Race conditions e invariantes de lógica de negocio (TOCTOU, check-then-act) — corre en todo proyecto, sin trigger:**
+- Cuotas/límites/contadores chequeados e incrementados en dos pasos separados en vez de una sola sentencia atómica (bypass de límite mensual/rate limit bajo concurrencia)
+- Tokens de un solo uso (reset de contraseña, OTP, invite) consumidos sin atomicidad — el mismo token puede usarse dos veces en paralelo
+- Idempotency keys guardadas solo en memoria de un proceso, o sin el usuario/principal como parte de la clave
+- Unicidad (email único, un pedido por click) garantizada solo por lógica de aplicación, sin constraint UNIQUE real en la base
+- Transiciones de estado (pending→approved→shipped→refunded) sin validar el estado actual antes de aplicar la siguiente — permite doble reembolso o pasos fuera de orden
+- Reservas de inventario/cupos/asientos sin liberación atómica en caso de abandono o timeout
+- Validación recomendada con prueba real de requests concurrentes (con autorización explícita) antes de reportar severidad CRITICAL/HIGH
+
 **Vectores avanzados y menos comunes (pero reales):**
 - Confusión de algoritmo JWT (RS256/HS256)
 - IDOR por IDs secuenciales/enumerables
